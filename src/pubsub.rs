@@ -150,7 +150,9 @@ impl PubSub {
 
         self.connection = Some(UnixStream::connect(&self.unix_path)?);
 
-        let setup_resp = self.send_control_message(Request::Setup)?;
+        let setup_resp = self.send_control_message(
+            Request::Setup(self.rx_slots, self.tx_slots)
+        )?;
         match setup_resp {
             Response::Setup(_) => {},
             _ => {

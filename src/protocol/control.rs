@@ -9,8 +9,9 @@ pub enum Request {
     Ping,
 
     /// Publisher/Subscriber client wants broker to set up a new shared memory
-    /// ring for data plane communication
-    Setup,
+    /// ring for data plane communication. Number of rx and tx slots
+    /// respectively
+    Setup(usize, usize),
 
     /// Publisher/Subscriber client wants to add a subscription
     AddSubscription(String),

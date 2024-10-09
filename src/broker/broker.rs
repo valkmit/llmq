@@ -164,7 +164,7 @@ impl Inner {
         match req {
             Request::Ping => Response::Pong,
 
-            Request::Setup => {
+            Request::Setup(rx_slots, tx_slots) => {
                 Response::Setup(client.path.clone())
             },
 
