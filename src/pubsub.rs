@@ -24,6 +24,7 @@ use crate::adapter::serde::{
 use crate::protocol::control::{Response, Request};
 
 /// Error type for the PubSub struct
+#[derive(Debug)]
 pub enum Error {
     /// We are not connected to the broker
     Disconnected,
@@ -194,26 +195,26 @@ impl PubSub {
             .write_all(&req_dst)?;
 
         // read the first bytes, which should contain the length of the data
-        let mut len_buf = [0u8; HEADER_SIZE];
+        let mut dst = BytesMut::with_capacity(HEADER_SIZE);
+        dst.resize(HEADER_SIZE, 0);
         self.connection
             .as_mut()
             .unwrap()
-            .read_exact(&mut len_buf)?;
+            .read_exact(&mut dst)?;
         let len: usize = Header::from_be_bytes(
-            len_buf.try_into().unwrap()
+            (&dst as &[u8]).try_into().unwrap()
         ) as usize;
 
-        // read the actual data into a BytesMut
-        let mut resp_dst = BytesMut::with_capacity(len);
-        resp_dst.resize(len, 0);
+        // read the actual data into the buffer
+        dst.resize(HEADER_SIZE + len, 0);
         self.connection
             .as_mut()
             .unwrap()
-            .read_exact(&mut resp_dst)?;
+            .read_exact(&mut dst[HEADER_SIZE..])?;
 
         // create a decoder and decode the response
         let mut decoder = BytesToType::<Response>::default();
-        let resp = decoder.decode(&mut resp_dst)?.unwrap();
+        let resp = decoder.decode(&mut dst)?.unwrap();
 
         Ok(resp)
     }
@@ -228,5 +229,18 @@ impl From<std::io::Error> for Error {
 impl From<bincode::Error> for Error {
     fn from(e: bincode::Error) -> Self {
         Error::Codec(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pubsub() {
+        let mut pubsub = PubSub::default();
+        pubsub.add_subscription("topic1");
+
+        pubsub.connect().unwrap();
     }
 }

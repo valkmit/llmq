@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 /// Publisher/Subscriber sends Request to Broker
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub enum Request {
     /// Client wishes to check that the connection is alive
     Ping,
@@ -21,7 +21,7 @@ pub enum Request {
 }
 
 /// Broker sends Response to Publisher/Subscriber
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub enum Response {
     /// Broker has successfully received a ping request
     Pong,
