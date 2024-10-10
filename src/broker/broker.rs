@@ -65,14 +65,6 @@ impl Broker {
     /// single worker thread, used to handle incoming connections and service
     /// them.
     pub fn run_control_plane_blocking(&self) {
-        // assuming we are able to bind, this means that we are the only
-        // instance running
-        let mut listener = UnixListenerStream::new(
-            UnixListener::bind(&self.inner.unix_path).unwrap()
-        );
-
-        // TODO: clean up old rings that were not properly closed
-        
         let rt = RuntimeBuilder::new_multi_thread()
             .worker_threads(1)
             .thread_name(CTRL_PLANE_THRD_NAME)
@@ -82,6 +74,14 @@ impl Broker {
 
         let inner = self.inner.clone();
         rt.block_on(async move {
+            // assuming we are able to bind, this means that we are the only
+            // instance running
+            let mut listener = UnixListenerStream::new(
+                UnixListener::bind(&self.inner.unix_path).unwrap()
+            );
+
+            // TODO: clean up old rings that were not properly closed
+
             loop {
                 let conn = listener.next().await;
                 if let Some(Ok(stream)) = conn {
