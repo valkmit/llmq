@@ -23,7 +23,9 @@ use crate::adapter::serde::{
 };
 use crate::protocol::control::{Response, Request};
 
-/// Error type for the PubSub struct
+/// Error type for the [`PubSub`]` struct
+/// 
+/// [`PubSub`]: crate::pubsub::PubSub
 #[derive(Debug)]
 pub enum Error {
     /// We are not connected to the broker
@@ -40,7 +42,9 @@ pub enum Error {
 }
 
 /// LLMQ messaging client. Can be used to both publish and receive messages
-/// from the broker.
+/// from the [`Broker`].
+/// 
+/// [`Broker`]: crate::broker::Broker
 pub struct PubSub {
     /// Number of rx slots in the ring buffer
     rx_slots: usize,

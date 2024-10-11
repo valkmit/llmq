@@ -1,3 +1,23 @@
+//! Broker module that handles control and data plane communication between
+//! publishers and subscribers, represented by [`PubSub`].
+//! 
+//! The broker is broken down into two main components, 1) the control plane
+//! and 2) the data plane.
+//! 
+//! The control plane is responsible for handling incoming connections from
+//! publishers and subscribers, and synchronizing shared memory rings between
+//! them.
+//! 
+//! The data plane is responsible for reading from client tx rings (rx from the
+//! broker's perspective), making a routing determination for where all to
+//! broadcast, and then writing to all client rx rings (tx from the broker's
+//! perspective).
+//! 
+//! Whenever there is a change in any client's subscriptions, the old
+//! forwarding table is marked dirty and rebuilt by another tokio thread.
+//! 
+//! [`PubSub`]: crate::pubsub::PubSub
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +34,6 @@ use tokio::time::sleep;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-// use crate::adapter::serde::{DeserializeStream, SerializeSink};
 use crate::adapter::serde::{BytesToType, TypeToBytes};
 use crate::protocol::control::{Request, Response};
 
