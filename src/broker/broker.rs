@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use futures_util::{SinkExt, StreamExt};
 use log::info;
 use md5::{Md5, Digest};
@@ -8,6 +10,7 @@ use tokio::spawn;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -31,6 +34,9 @@ struct Inner {
     /// Clients connected to the server - doesn't guarantee that the clients
     /// have actually established an rx/tx ring yet
     clients: Mutex<HashMap<String, Arc<Client>>>,
+
+    /// Fordwarding table needs to be rebuilt
+    forwarding_table_dirty: ArcSwap<bool>,
 }
 
 /// Orchestrator that connects publishers and subscribers to each other. Safe
@@ -54,6 +60,7 @@ impl Broker {
                 unix_path: unix_path.into(),
                 shmem_directory: shmem_directory.into(),
                 clients: Default::default(),
+                forwarding_table_dirty: Arc::new(false).into(),
             }),
         }
     }
@@ -82,6 +89,13 @@ impl Broker {
 
             // TODO: clean up old rings that were not properly closed
 
+            {
+                let inner = inner.clone();
+                spawn(async move {
+                    inner.rebuild_forwarding_table().await;
+                });
+            }
+
             loop {
                 let conn = listener.next().await;
                 if let Some(Ok(stream)) = conn {
@@ -94,6 +108,13 @@ impl Broker {
         });
     }
 
+    /// Runs the data plane, which is a hotloop that reads from client tx rings
+    /// (thus, rx from the broker's perspective), makes a routing determination
+    /// for where all to broadcast, and then writes to all client rx rings (
+    /// thus, tx from the broker's perspective).
+    /// 
+    /// This function blocks forever. Caller is responsible for deciding how
+    /// to pin this to a specific core, or giving it another name.
     pub fn run_data_plane_blocking(&self) {
         loop {
 
@@ -102,6 +123,37 @@ impl Broker {
 }
 
 impl Inner {
+    /// Continuously checks if the forwarding table needs to be rebuilt
+    async fn rebuild_forwarding_table(&self) {
+        loop {
+            // sleep for 100ms, then check if the forwarding table is dirty
+            // and needs to be rebuilt
+            sleep(Duration::from_millis(100)).await;
+            if **self.forwarding_table_dirty.load() {
+                // ordering is very important to avoid race conditions here.
+                // the absolute first thing we need to do, is set dirty to
+                // false
+                //
+                // if we don't do this, then we can end up in a situation where
+                // while we're rebuilding the table, another thread sets it
+                // to be dirty again, then we set dirty to false, and never
+                // end up rebuilding the table.
+                self.forwarding_table_dirty.store(false.into());
+
+                // at this point it doesn't matter if another thread has set
+                // dirty = true in between the load and store lines above,
+                // because no matter what we're rebuilding the table
+                self.rebuild_forwarding_table_inner().await;
+            }
+        }
+    }
+
+    /// Rebuilds the forwarding table
+    async fn rebuild_forwarding_table_inner(&self) {
+        // acquire lock
+        let clients = self.clients.lock().await;
+    }
+
     /// Handles an individual connection to the control plane. Main loop that
     /// waits for requests and responds
     async fn handle_control_plane_connection(
@@ -169,15 +221,15 @@ impl Inner {
             },
 
             Request::AddSubscription(topic) => {
-                Response::AddSubscription(
-                    client.add_subscription(topic).await
-                )
+                let subs = client.add_subscription(topic).await;
+                self.forwarding_table_dirty.store(true.into());
+                Response::AddSubscription(subs)
             },
 
             Request::RemoveSubscription(topic) => {
-                Response::RemoveSubscription(
-                    client.remove_subscription(topic).await
-                )
+                let subs = client.remove_subscription(topic).await;
+                self.forwarding_table_dirty.store(true.into());
+                Response::RemoveSubscription(subs)
             },
         }
     }
