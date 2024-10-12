@@ -38,6 +38,7 @@ use crate::adapter::serde::{BytesToType, TypeToBytes};
 use crate::protocol::control::{Request, Response};
 
 use super::client::Client;
+use super::forwarding_table::{self, ForwardingTable};
 
 /// Name of the tokio runtime thread that handles control-plane requests
 const CTRL_PLANE_THRD_NAME: &str = "llmq-control-plane";
@@ -58,7 +59,7 @@ struct Inner {
     forwarding_table_dirty: ArcSwap<bool>,
 
     /// Actual forwarding table that is running
-    forwarding_table: ArcSwap<HashMap<String, Vec<Arc<Client>>>>,
+    forwarding_table: ArcSwap<ForwardingTable>,
 }
 
 /// Orchestrator that connects publishers and subscribers to each other. Safe
@@ -83,7 +84,7 @@ impl Broker {
                 shmem_directory: shmem_directory.into(),
                 clients: Default::default(),
                 forwarding_table_dirty: Arc::new(false).into(),
-                forwarding_table: Arc::new(HashMap::new()).into(),
+                forwarding_table: Arc::new(ForwardingTable::default()).into(),
             }),
         }
     }
@@ -140,7 +141,7 @@ impl Broker {
     /// to pin this to a specific core, or giving it another name.
     pub fn run_data_plane_blocking(&self) {
         loop {
-
+            self.inner.forwarding_table.load().poll();
         }
     }
 }
@@ -163,44 +164,23 @@ impl Inner {
                 // end up rebuilding the table.
                 self.forwarding_table_dirty.store(false.into());
 
+                // we need to make a clone of the clients values, so that we
+                // avoid any deadlock situations as we will be locking
+                // subscriptions on each client as well
+                let clients = self.clients
+                    .lock()
+                    .await
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+
                 // at this point it doesn't matter if another thread has set
                 // dirty = true in between the load and store lines above,
                 // because no matter what we're rebuilding the table
-                self.rebuild_forwarding_table_inner().await;
+                let forwarding_table = ForwardingTable::new(clients).await;
+                self.forwarding_table.store(forwarding_table.into());
             }
         }
-    }
-
-    /// Rebuilds the forwarding table
-    /// 
-    /// Clones the list of connected clients (which is a simple operation as
-    /// they are Arcs), and uses them to build a new forwarding table. We then
-    /// swap the running forwarding table with the new one atomically
-    async fn rebuild_forwarding_table_inner(&self) {
-        // we need to make a clone of the clients values, so that we avoid any
-        // deadlock situations as we will be locking subscriptions on each
-        // client as well
-        let clients = self.clients
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-
-        // build the forwarding table per topic
-        let mut table = HashMap::<String, Vec<Arc<Client>>>::new();
-        for client in clients {
-            for topic in client.subscriptions().await.iter() {
-                let clients = table
-                    .entry(topic.clone())
-                    .or_insert_with(Default::default);
-                clients.push(client.clone());
-            }
-        }
-
-        // now we can swap out the running forwarding table with the one that
-        // we just built
-        self.forwarding_table.store(table.into());
     }
 
     /// Handles an individual connection to the control plane. Main loop that
