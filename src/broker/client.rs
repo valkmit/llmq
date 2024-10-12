@@ -46,6 +46,10 @@ impl Client {
         subs.clear();
     }
 
+    pub async fn subscriptions(&self) -> HashSet<String> {
+        self.subscriptions.lock().await.clone()
+    }
+
     pub fn ring_paths(&self) -> (String, String) {
         let rx = format!("{}_rx", self.path);
         let tx = format!("{}_tx", self.path);

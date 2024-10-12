@@ -56,6 +56,9 @@ struct Inner {
 
     /// Fordwarding table needs to be rebuilt
     forwarding_table_dirty: ArcSwap<bool>,
+
+    /// Actual forwarding table that is running
+    forwarding_table: ArcSwap<HashMap<String, Vec<Arc<Client>>>>,
 }
 
 /// Orchestrator that connects publishers and subscribers to each other. Safe
@@ -80,6 +83,7 @@ impl Broker {
                 shmem_directory: shmem_directory.into(),
                 clients: Default::default(),
                 forwarding_table_dirty: Arc::new(false).into(),
+                forwarding_table: Arc::new(HashMap::new()).into(),
             }),
         }
     }
@@ -168,11 +172,35 @@ impl Inner {
     }
 
     /// Rebuilds the forwarding table
+    /// 
+    /// Clones the list of connected clients (which is a simple operation as
+    /// they are Arcs), and uses them to build a new forwarding table. We then
+    /// swap the running forwarding table with the new one atomically
     async fn rebuild_forwarding_table_inner(&self) {
-        // acquire lock
-        let clients = self.clients.lock().await;
+        // we need to make a clone of the clients values, so that we avoid any
+        // deadlock situations as we will be locking subscriptions on each
+        // client as well
+        let clients = self.clients
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
 
+        // build the forwarding table per topic
         let mut table = HashMap::<String, Vec<Arc<Client>>>::new();
+        for client in clients {
+            for topic in client.subscriptions().await.iter() {
+                let clients = table
+                    .entry(topic.clone())
+                    .or_insert_with(Default::default);
+                clients.push(client.clone());
+            }
+        }
+
+        // now we can swap out the running forwarding table with the one that
+        // we just built
+        self.forwarding_table.store(table.into());
     }
 
     /// Handles an individual connection to the control plane. Main loop that
