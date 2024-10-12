@@ -41,6 +41,11 @@ impl Client {
         subs.clone()
     }
 
+    pub async fn clear_subscriptions(&self) {
+        let mut subs = self.subscriptions.lock().await;
+        subs.clear();
+    }
+
     pub fn ring_paths(&self) -> (String, String) {
         let rx = format!("{}_rx", self.path);
         let tx = format!("{}_tx", self.path);

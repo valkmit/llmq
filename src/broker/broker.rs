@@ -171,6 +171,8 @@ impl Inner {
     async fn rebuild_forwarding_table_inner(&self) {
         // acquire lock
         let clients = self.clients.lock().await;
+
+        let mut table = HashMap::<String, Vec<Arc<Client>>>::new();
     }
 
     /// Handles an individual connection to the control plane. Main loop that
@@ -285,8 +287,16 @@ impl Inner {
     }
 
     /// Removes a client from the clients map, if it exists
+    /// 
+    /// Also marks the forwarding table as dirty (if a client was found)
     async fn remove_client(&self, client: Arc<Client>) {
         let mut clients = self.clients.lock().await;
-        clients.remove(client.path.as_str());
+        if let Some(client) = clients.remove(client.path.as_str()) {
+            // clear the clients subscriptions, and mark the forwarding table
+            // as dirty. this will cause a rebuild and the last reference to
+            // the client in the forwarding table to be dropped
+            client.clear_subscriptions().await;
+            self.forwarding_table_dirty.store(true.into());
+        }
     }
 }
