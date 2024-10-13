@@ -2,6 +2,12 @@
 name = "llmq"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "low latency multiprocess message queue"
+keywords = ["broker", "messagebus", "multiprocess"]
+homepage = "https://github.com/valkmit/llmq"
+repository = "https://github.com/valkmit/llmq"
+readme = "README.md"
 
 [dependencies]
 arc-swap = "1.7.1"
