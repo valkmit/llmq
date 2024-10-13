@@ -2,6 +2,7 @@ pub mod adapter;
 mod broker;
 pub mod protocol;
 pub mod pubsub;
+mod queue;
 
 use std::{env, thread};
 use std::sync::Arc;
