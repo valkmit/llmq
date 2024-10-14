@@ -1,3 +1,3 @@
 mod mapping;
 
-pub use mapping::Mapping;
+pub use mapping::{Error, Mapping};

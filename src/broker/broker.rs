@@ -38,7 +38,7 @@ use crate::adapter::serde::{BytesToType, TypeToBytes};
 use crate::protocol::control::{Request, Response};
 
 use super::client::Client;
-use super::forwarding_table::{self, ForwardingTable};
+use super::forwarding_table::ForwardingTable;
 
 /// Name of the tokio runtime thread that handles control-plane requests
 const CTRL_PLANE_THRD_NAME: &str = "llmq-control-plane";
@@ -246,7 +246,8 @@ impl Inner {
             Request::Ping => Response::Pong,
 
             Request::Setup(rx_slots, tx_slots) => {
-                Response::Setup(client.path.clone())
+                let (client_rx, client_tx) = client.ring_paths();
+                Response::Setup(client_rx, client_tx)
             },
 
             Request::AddSubscription(topic) => {

@@ -22,6 +22,8 @@ use crate::adapter::serde::{
     HEADER_SIZE,
 };
 use crate::protocol::control::{Response, Request};
+use crate::queue::Mapping;
+use crate::queue::Error as MappingError;
 
 /// Error type for the [`PubSub`]` struct
 /// 
@@ -39,6 +41,9 @@ pub enum Error {
 
     /// Unexpected type of response from broker
     Unexpected(Response),
+
+    /// Error with the mapping
+    Mapping(MappingError),
 }
 
 /// LLMQ messaging client. Can be used to both publish and receive messages
@@ -62,6 +67,12 @@ pub struct PubSub {
 
     /// UNIX stream to the broker
     connection: Option<UnixStream>,
+
+    /// Attached mapping to the rx rings set up by the broker
+    rx_mapping: Option<Mapping>,
+
+    /// Attached mapping to the tx rings set up by the broker
+    tx_mapping: Option<Mapping>,
 }
 
 /// Default UNIX socket path the broker control socket listens on
@@ -115,6 +126,8 @@ impl PubSub {
             unix_path: path.into(),
             subscriptions: Default::default(),
             connection: None,
+            rx_mapping: None,
+            tx_mapping: None,
         }
     }
 
@@ -159,9 +172,14 @@ impl PubSub {
             Request::Setup(self.rx_slots, self.tx_slots)
         )?;
         match setup_resp {
-            Response::Setup(_) => {},
+            // received a setup response, let's stand up the mapping
+            Response::Setup(rx_path, tx_path) => {
+                self.rx_mapping = Some(Mapping::new_attach(rx_path)?);
+                self.tx_mapping = Some(Mapping::new_attach(tx_path)?);
+            },
+
+            // we got an unexpected response, disconnect
             _ => {
-                // we got an unexpected response, disconnect
                 self.connection = None;
                 return Err(Error::Unexpected(setup_resp));
             },
@@ -233,6 +251,12 @@ impl From<std::io::Error> for Error {
 impl From<bincode::Error> for Error {
     fn from(e: bincode::Error) -> Self {
         Error::Codec(e)
+    }
+}
+
+impl From<MappingError> for Error {
+    fn from(e: MappingError) -> Self {
+        Error::Mapping(e)
     }
 }
 
