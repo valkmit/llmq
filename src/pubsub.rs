@@ -196,6 +196,47 @@ impl PubSub {
         Ok(())
     }
 
+    /// Enqueue a message to be sent to the broker under the given topic
+    pub fn enqueue_bytes<S>(&self, topic: S, buf: &[u8])
+    where
+        S: Into<String>,
+    {
+        unimplemented!();
+    }
+
+    /// Enqueue a message to be sent to the broker under the given topic.
+    /// 
+    /// The message is serialized using bincode
+    pub fn enqueue_type<S, T>(&self, topic: S, item: T)
+    where
+        S: Into<String>,
+        T: serde::Serialize,
+    {
+        unimplemented!();
+    }
+
+    /// Dequeue a message from the broker, returning the topic and the message
+    /// in a newly-allocated Vec<u8>
+    pub fn dequeue_bytes(&self) -> (String, Vec<u8>) {
+        unimplemented!();
+    }
+
+    /// Dequeue a message from the broker, returning the topic and message
+    /// buffer copied into the provided buffer
+    pub fn dequeue_bytes_into(&self, dst: &mut [u8]) -> (String, usize) {
+        unimplemented!();
+    }
+
+    /// Dequeue a message from the broker, returning the topic and the message
+    /// 
+    /// The message is deserialized using bincode
+    pub fn dequeue_type<T>(&self) -> (String, T)
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        unimplemented!();
+    }
+
     /// Sends a request over the control socket and waits for a response. In
     /// the event of an error, the connection is cleared and we return the
     /// specific error
