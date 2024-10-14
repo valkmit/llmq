@@ -73,7 +73,7 @@ pub struct Mapping {
     _mmap: MmapMut,
 
     /// Points to the registers in the memory-mapped file
-    pub registers: *mut Registers,
+    registers: *mut Registers,
     
     /// List of all buffers in the buffer pool. Used as a nice wrapper to store
     /// headroom data in the buffer itself
@@ -197,7 +197,49 @@ impl Mapping {
     where
         S: Into<String>,
     {
-        unimplemented!()
+        // open the file at path
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.into())?;
+
+        // map the file into memory
+        let mut mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+
+        // get the pointer to the registers
+        let buf = mmap.as_mut_ptr();
+        let registers = buf as *mut Registers;
+
+        // load the buffer size and buffer pool size
+        let (
+            buffer_size,
+            buffer_pool_size
+        ) = unsafe {(
+            (*registers).buffer_size,
+            (*registers).buffer_pool_size
+        )};
+
+        // set up the buffer pool
+        let mut ring_buffer_ptr = unsafe { buf.add(CACHE_LINE_SIZE) };
+        let mut buffer_pool = Vec::with_capacity(buffer_pool_size);
+        for _ in 0..buffer_pool_size {
+            let length = ring_buffer_ptr as *mut usize;
+            ring_buffer_ptr = unsafe {
+                ring_buffer_ptr.add(std::mem::size_of::<BufferLength>()) 
+            };
+            let data = ring_buffer_ptr;
+            ring_buffer_ptr = unsafe {
+                ring_buffer_ptr.add(buffer_size)
+            };
+
+            buffer_pool.push(Buffer { length, data });
+        }
+
+        Ok(Mapping {
+            _mmap: mmap,
+            registers,
+            buffer_pool,
+        })
     }
 
     /// Number of pending entries in the queue that have not been dequeued. In
@@ -397,6 +439,37 @@ mod tests {
 
         let mut output = vec![vec![0u8; 1024]; 16];
         let dequeued = mapping.dequeue_bulk_bytes(&mut output);
+        println!("dequeue: {}", dequeued);
+
+        for idx in 0..dequeued {
+            assert_eq!(&output[idx], &data[idx]);
+        }
+    }
+
+    /// Using two different mappings, enqueue and dequeue some data and be
+    /// sure that the data is the same.
+    #[test]
+    fn test_dual_mapping_enqueue_dequeue() {
+        // create producer + attach consumer
+        let producer = Mapping::new_create(
+            "/dev/shm/test_dual_mapping_enqueue_dequeue_producer",
+            2048,
+            16,
+        ).unwrap();
+        let consumer = Mapping::new_attach(
+            "/dev/shm/test_dual_mapping_enqueue_dequeue_producer",
+        ).unwrap();
+
+        let data = vec![
+            [0u8; 16],
+            [1u8; 16],
+            [2u8; 16],
+            [3u8; 16],
+        ];
+        println!("enqueue: {}", producer.enqueue_bulk_bytes(&data));
+
+        let mut output = vec![vec![0u8; 1024]; 16];
+        let dequeued = consumer.dequeue_bulk_bytes(&mut output);
         println!("dequeue: {}", dequeued);
 
         for idx in 0..dequeued {
