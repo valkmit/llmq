@@ -17,6 +17,7 @@ futures-util = { version = "=0.3.30", features = ["sink"] }
 hex = "=0.4.3"
 log = "=0.4.22"
 md-5 = "=0.10.6"
+memmap = "=0.7.0"
 rand = "=0.8.5"
 serde = { version = "=1.0.210", features = ["derive"] }
 tokio = { version = "=1.40.0", features = ["rt-multi-thread", "net", "macros"] }
