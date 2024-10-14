@@ -34,7 +34,8 @@ pub enum Error {
     BufferSize,
     
     /// Number of elements must be a power of 2, and must be large enough to
-    /// store buffer headroom data
+    /// store buffer headroom data. Size of headroom is governed by
+    /// [`BufferLength`]
     BufferPoolSize,
 
     /// An I/O error occurred dealing with the mmap backend
@@ -89,6 +90,8 @@ impl Mapping {
     /// 
     /// This is independent of whether or not the caller intends to use the
     /// mapping in a producer or consumer role
+    /// 
+    /// Returns an [`Error`] if unsuccesful
     pub fn new_create<S>(
         path: S,
         buffer_size: usize,
@@ -102,13 +105,18 @@ impl Mapping {
             return Err(Error::BufferSize);
         }
 
+        // verify buffer size is greater than size of BufferLength
+        if buffer_size <= std::mem::size_of::<BufferLength>() {
+            return Err(Error::BufferSize);
+        }
+
         // verify buffer pool size is a power of 2
         if buffer_pool_size.count_ones() != 1 {
             return Err(Error::BufferPoolSize);
         }
 
-        // verify buffer pool size is greater than size of BufferLength
-        if buffer_pool_size <= std::mem::size_of::<BufferLength>() {
+        // verify buffer pool size is greater than 0
+        if buffer_pool_size == 0 {
             return Err(Error::BufferPoolSize);
         }
 
@@ -169,6 +177,8 @@ impl Mapping {
     /// 
     /// This is independent of whether or not the caller intends to use the
     /// mapping in a producer or consumer role
+    /// 
+    /// Returns an [`Error`] if unsuccesful
     /// 
     /// [`new_create`]: Self::new_create
     pub fn new_attach<S>(path: S) -> Result<Self, Error>
@@ -353,7 +363,7 @@ mod tests {
             16,
         ).unwrap();
 
-        let mut data = vec![
+        let data = vec![
             [0u8; 16],
             [1u8; 16],
             [2u8; 16],
