@@ -1,6 +1,11 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use tokio::sync::Mutex;
+
+use crate::queue::Mapping;
+use crate::queue::Error as MappingError;
 
 /// Represents a client connected to the Broker. Note that this is intended
 /// to be used by the [`Broker`] internally, and not by external pubsub clients.
@@ -10,6 +15,20 @@ pub struct Client {
 
     /// Set of subscriptions this client has
     subscriptions: Mutex<HashSet<String>>,
+
+    /// From the perspective of the broker, the tx ring.
+    /// 
+    /// Note that this will be the opposite of what [`ring_paths`] returns.
+    /// 
+    /// [`ring_paths`]: Client::ring_paths
+    tx_mapping: ArcSwap<Option<Mapping>>,
+
+    /// From the perspective of the broker, the rx ring.
+    /// 
+    /// Note that this will be the opposite of what [`ring_paths`] returns.
+    /// 
+    /// [`ring_paths`]: Client::ring_paths
+    rx_mapping: ArcSwap<Option<Mapping>>,
 }
 
 impl Client {
@@ -19,8 +38,33 @@ impl Client {
     {
         Self {
             path: path.into(),
-            subscriptions: Default::default(),
+            subscriptions: Default::default(),  
+            tx_mapping: Arc::new(None).into(),
+            rx_mapping: Arc::new(None).into(),
         }
+    }
+
+    /// Establishes the rx and tx rings based on the sizing info the client
+    /// has provided us.
+    pub fn setup_rings(
+        &self,
+        client_rx_slots: usize,
+        client_tx_slots: usize,
+    ) -> Result<(), MappingError> {
+        // note that we are inverting the ordering of the ring paths, since we
+        // store the rings from the perspective of the broker, whereas
+        // ring_paths returns them from the perspective of the client
+        let (tx_path, rx_path) = self.ring_paths();
+
+        // set up the rx and tx rings - note that we flip client_*x_slots and
+        // rx/tx, because this is the client itself informing the broker of the
+        // sizes of the rings
+        let tx = Mapping::new_create(tx_path, 4096, client_rx_slots)?;
+        let rx = Mapping::new_create(rx_path, 4096, client_tx_slots)?;
+
+        self.tx_mapping.store(Some(tx).into());
+        self.rx_mapping.store(Some(rx).into());
+        Ok(())
     }
 
     /// Adds a subscription to this client
@@ -64,5 +108,22 @@ impl Client {
         let rx = format!("{}_rx", self.path);
         let tx = format!("{}_tx", self.path);
         (rx, tx)
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // note that we are inverting the ordering of the ring paths, since we
+        // store the rings from the perspective of the broker, whereas
+        // ring_paths returns them from the perspective of the client
+        let (tx_path, rx_path) = self.ring_paths();
+
+        if let Some(rx) = self.rx_mapping.load().as_ref() {
+            // TODO: clean up the ring from the filesystem
+        }
+
+        if let Some(tx) = self.tx_mapping.load().as_ref() {
+            // TODO: clean up the ring from the filesystem
+        }
     }
 }

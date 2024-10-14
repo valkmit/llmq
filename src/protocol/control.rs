@@ -28,7 +28,7 @@ pub enum Response {
 
     /// Broker has successfully set up a new shared memory ring for data plane
     /// communication, and it is now available at the given path
-    Setup(String),
+    Setup(String, String),
 
     /// Broker has successfully added a subscription. Current subscriptions are
     /// returned

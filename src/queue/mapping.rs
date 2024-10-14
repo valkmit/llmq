@@ -15,6 +15,7 @@
 //! read-only manner, and in this case the act of dequeueing is NOT considered
 //! a read-only operation as it must manipulate the registers)
 
+use std::fmt;
 use std::io::Error as IoError;
 use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -63,6 +64,9 @@ pub struct Registers {
 }
 
 /// Mapping of a queue to memory that can be shared across processes
+/// 
+/// Although it's marked as Send+Sync, caller should never allow more than one
+/// producer or more than one consumer per mapping.
 pub struct Mapping {
     /// Memory-mapped file we store to prevent dropping and unmapping. This
     /// would cause other pointers in memory to become dangling
@@ -75,6 +79,14 @@ pub struct Mapping {
     /// headroom data in the buffer itself
     buffer_pool: Vec<Buffer>,
 }
+
+// Safety: Mapping is Send because *mut Registers points to memory-mapped
+// memory.
+unsafe impl Send for Mapping {}
+
+// Safety: Mapping is Sync because *mut Registers points to memory-mapped
+// memory that we use atomics to read/write from
+unsafe impl Sync for Mapping {}
 
 type BufferLength = usize;
 
@@ -342,6 +354,18 @@ fn calculate_mapping_size(
 impl From<IoError> for Error {
     fn from(e: IoError) -> Self {
         Error::Io(e)
+    }
+}
+
+// implement display for Error
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::BufferSize => write!(f, "buffer size invalid"),
+            Error::BufferPoolSize => write!(f, "buffer pool size invalid"),
+            Error::Io(e) => write!(f, "I/O error: {}", e),
+        }
     }
 }
 

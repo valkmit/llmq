@@ -36,6 +36,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::adapter::serde::{BytesToType, TypeToBytes};
 use crate::protocol::control::{Request, Response};
+use crate::queue::Error as MappingError;
 
 use super::client::Client;
 use super::forwarding_table::ForwardingTable;
@@ -110,8 +111,6 @@ impl Broker {
             let mut listener = UnixListenerStream::new(
                 UnixListener::bind(&self.inner.unix_path).unwrap()
             );
-
-            // TODO: clean up old rings that were not properly closed
 
             {
                 let inner = inner.clone();
@@ -220,10 +219,16 @@ impl Inner {
             };
 
             // handle and generate response
-            let resp = self.handle_control_plane_connection_request(
+            let resp = match self.handle_control_plane_connection_request(
                 client.clone(),
                 req
-            ).await;
+            ).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    info!("Error handling request: {}", e);
+                    break;
+                },
+            };
 
             // send generated response to client
             if let Err(err) = resp_tx.send(resp).await {
@@ -241,25 +246,26 @@ impl Inner {
         &self,
         client: Arc<Client>,
         req: Request
-    ) -> Response {
+    ) -> Result<Response, MappingError> {
         match req {
-            Request::Ping => Response::Pong,
+            Request::Ping => Ok(Response::Pong),
 
             Request::Setup(rx_slots, tx_slots) => {
                 let (client_rx, client_tx) = client.ring_paths();
-                Response::Setup(client_rx, client_tx)
+                client.setup_rings(rx_slots, tx_slots).unwrap();
+                Ok(Response::Setup(client_rx, client_tx))
             },
 
             Request::AddSubscription(topic) => {
                 let subs = client.add_subscription(topic).await;
                 self.forwarding_table_dirty.store(true.into());
-                Response::AddSubscription(subs)
+                Ok(Response::AddSubscription(subs))
             },
 
             Request::RemoveSubscription(topic) => {
                 let subs = client.remove_subscription(topic).await;
                 self.forwarding_table_dirty.store(true.into());
-                Response::RemoveSubscription(subs)
+                Ok(Response::RemoveSubscription(subs))
             },
         }
     }
