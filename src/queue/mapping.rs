@@ -269,7 +269,7 @@ impl Mapping {
     }
 
     /// Bulk dequeue operation. Returns number of entries succesfully dequeued
-    pub fn dequeue_bulk_bytes(&self, data: &mut [impl AsMut<[u8]>]) -> usize {
+    pub fn dequeue_bulk_bytes(&self, data: &mut [Vec<u8>]) -> usize {
         // trim data to the smaller of the two (pending or data length)
         let dequeued = data.len().min(self.pending());
 
@@ -285,8 +285,6 @@ impl Mapping {
         let tail_start = tail.load(Ordering::Acquire);
 
         for (data_idx, output) in data.iter_mut().enumerate() {
-            let output = output.as_mut();
-
             // get the buffer to read from
             let ring_idx = (tail_start + data_idx) % buffer_pool_size;
             let buffer = &self.buffer_pool[ring_idx];
@@ -297,15 +295,11 @@ impl Mapping {
                 let length = buffer.length.read_volatile();
                 buffer.length.write_volatile(0);
 
-                // copy the data out of the buffer
-                std::ptr::copy_nonoverlapping(
-                    buffer.data,
-                    output.as_mut_ptr(),
-                    length
+                // copy the data into the output
+                output.clear();
+                output.extend_from_slice(
+                    std::slice::from_raw_parts(buffer.data, length)
                 );
-
-                // update the length of the output buffer
-                // output.as_mut_slice().truncate(length);
             }
         }
 
@@ -368,10 +362,11 @@ mod tests {
         println!("enqueue: {}", mapping.enqueue_bulk_bytes(&data));
 
         let mut output = vec![vec![0u8; 1024]; 16];
-        println!("dequeue: {}", mapping.dequeue_bulk_bytes(&mut output));
+        let dequeued = mapping.dequeue_bulk_bytes(&mut output);
+        println!("dequeue: {}", dequeued);
 
-        for (idx, item) in output.iter().enumerate() {
-            assert_eq!(item, &data[idx]);
+        for idx in 0..dequeued {
+            assert_eq!(&output[idx], &data[idx]);
         }
     }
 }
