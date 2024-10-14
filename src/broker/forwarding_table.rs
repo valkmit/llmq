@@ -43,15 +43,34 @@ impl ForwardingTable {
         }
     }
 
+    /// Receives messages from publishers and forwards them to subscribers
     pub fn poll(&self) {
+        let mut buf = vec![vec![]; 16];
+
         // iterate over every client that is capable of publishing to the
         // broker...
         for p in self.publishers.iter() {
             // get the next message from the client and break it down into
             // the topic and the body
+            let rx_count = if let Some(rx) = p.rx_mapping.load().as_ref() {
+                rx.dequeue_bulk_bytes(&mut buf)
+            } else {
+                0
+            };
 
             // walk the list of clients that are interested in the topic
             // and forward the message to them
+            for d in self.publishers.iter() {
+                if Arc::<Client>::ptr_eq(p, d) {
+                    continue;
+                }
+                let tx_opt = d.tx_mapping.load();
+                let Some(tx) = tx_opt.as_ref() else {
+                    continue;
+                };
+
+                tx.enqueue_bulk_bytes(&mut buf[..rx_count]);
+            }
         }
     }
 }

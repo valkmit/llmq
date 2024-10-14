@@ -21,14 +21,14 @@ pub struct Client {
     /// Note that this will be the opposite of what [`ring_paths`] returns.
     /// 
     /// [`ring_paths`]: Client::ring_paths
-    tx_mapping: ArcSwap<Option<Mapping>>,
+    pub(super) tx_mapping: ArcSwap<Option<Mapping>>,
 
     /// From the perspective of the broker, the rx ring.
     /// 
     /// Note that this will be the opposite of what [`ring_paths`] returns.
     /// 
     /// [`ring_paths`]: Client::ring_paths
-    rx_mapping: ArcSwap<Option<Mapping>>,
+    pub(super) rx_mapping: ArcSwap<Option<Mapping>>,
 }
 
 impl Client {
