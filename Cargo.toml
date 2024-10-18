@@ -13,7 +13,7 @@ readme = "README.md"
 arc-swap = "1.7.1"
 bincode = "=1.3.3"
 flexi_logger = { version = "=0.29.0", features = ["async"] }
-futures-util = { version = "=0.3.30", features = ["sink"] }
+futures-util = { version = "=0.3.31", features = ["sink"] }
 hex = "=0.4.3"
 log = "=0.4.22"
 md-5 = "=0.10.6"

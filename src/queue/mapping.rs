@@ -15,12 +15,15 @@
 //! read-only manner, and in this case the act of dequeueing is NOT considered
 //! a read-only operation as it must manipulate the registers)
 
+use std::cell::UnsafeCell;
 use std::fmt;
 use std::io::Error as IoError;
 use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memmap::{MmapMut, MmapOptions};
+
+use super::buffer_pool::BufferPool;
 
 /// Size of cache line, to prevent false sharing
 const CACHE_LINE_SIZE: usize = 64;
@@ -40,8 +43,13 @@ pub enum Error {
     BufferPoolSize,
 
     /// An I/O error occurred dealing with the mmap backend
-    Io(IoError)
+    Io(IoError),
+
+    /// Not enough buffers available in pool
+    NoBuffers,
 }
+
+type BufferIndex = u32;
 
 /// Registers that are stored in beginning of the memory-mapped file.
 /// 
@@ -51,16 +59,19 @@ pub enum Error {
 #[repr(C)]
 pub struct Registers {
     /// Head of the queue, what producer writes to
-    head: usize,
+    head: AtomicUsize,
 
     /// Tail of the queue, what consumer reads from
-    tail: usize,
+    tail: AtomicUsize,
 
     /// Size of individual buffer, in bytes
     buffer_size: usize,
 
     /// Number of buffers in the queue
     buffer_pool_size: usize,
+
+    /// Number of slots in the ring buffer
+    slots: usize,
 }
 
 /// Mapping of a queue to memory that can be shared across processes
@@ -74,10 +85,15 @@ pub struct Mapping {
 
     /// Points to the registers in the memory-mapped file
     registers: *mut Registers,
+
+    /// Number of slots in the ring buffer
+    slots: usize,
+
+    /// Ring buffer of indices 
+    ring: Vec<*mut BufferIndex>,
     
-    /// List of all buffers in the buffer pool. Used as a nice wrapper to store
-    /// headroom data in the buffer itself
-    buffer_pool: Vec<Buffer>,
+    /// Pool of buffer chains
+    buffer_pool: UnsafeCell<BufferPool>,
 }
 
 // Safety: Mapping is Send because *mut Registers points to memory-mapped
@@ -87,14 +103,6 @@ unsafe impl Send for Mapping {}
 // Safety: Mapping is Sync because *mut Registers points to memory-mapped
 // memory that we use atomics to read/write from
 unsafe impl Sync for Mapping {}
-
-type BufferLength = usize;
-
-/// A single buffer in the buffer pool
-struct Buffer {
-    length: *mut BufferLength,
-    data: *mut u8,
-}
 
 impl Mapping {
     /// Creates the memory-mapped files needed for a ring buffer. Accepts
@@ -108,6 +116,7 @@ impl Mapping {
         path: S,
         buffer_size: usize,
         buffer_pool_size: usize,
+        slots: usize,
     ) -> Result<Self, Error>
     where
         S: Into<String>,
@@ -117,18 +126,8 @@ impl Mapping {
             return Err(Error::BufferSize);
         }
 
-        // verify buffer size is greater than size of BufferLength
-        if buffer_size <= std::mem::size_of::<BufferLength>() {
-            return Err(Error::BufferSize);
-        }
-
-        // verify buffer pool size is a power of 2
-        if buffer_pool_size.count_ones() != 1 {
-            return Err(Error::BufferPoolSize);
-        }
-
-        // verify buffer pool size is greater than 0
-        if buffer_pool_size == 0 {
+        // verify buffer pool size is a power of 2 and greater than 0
+        if buffer_pool_size.count_ones() != 1 || buffer_pool_size == 0 {
             return Err(Error::BufferPoolSize);
         }
 
@@ -137,6 +136,7 @@ impl Mapping {
         let file_size = calculate_mapping_size(
             buffer_size,
             buffer_pool_size,
+            slots,
             PAGE_SIZE,
         );
         let file = OpenOptions::new()
@@ -155,31 +155,37 @@ impl Mapping {
 
         // write to the registers with the config options we've been given
         unsafe {
-            (*registers).head = 0;
-            (*registers).tail = 0;
-            (*registers).buffer_size = buffer_size;
-            (*registers).buffer_pool_size = buffer_pool_size;
+            (*registers) = Registers {
+                head: AtomicUsize::new(0),
+                tail: AtomicUsize::new(0),
+                buffer_size,
+                buffer_pool_size,
+                slots,
+            };
+        }
+
+        // set up the ring buffer
+        let ring_start = unsafe { mmap.as_mut_ptr().add(CACHE_LINE_SIZE) };
+        let mut ring = Vec::with_capacity(slots);
+        for i in 0..slots {
+            ring.push(unsafe { 
+                ring_start.add(i * size_of::<BufferIndex>()) as *mut BufferIndex 
+            });
         }
 
         // set up the buffer pool
-        let mut ring_buffer_ptr = unsafe { buf.add(CACHE_LINE_SIZE) };
-        let mut buffer_pool = Vec::with_capacity(buffer_pool_size);
-        for _ in 0..buffer_pool_size {
-            let length = ring_buffer_ptr as *mut usize;
-            ring_buffer_ptr = unsafe {
-                ring_buffer_ptr.add(std::mem::size_of::<BufferLength>()) 
-            };
-            let data = ring_buffer_ptr;
-            ring_buffer_ptr = unsafe {
-                ring_buffer_ptr.add(buffer_size)
-            };
-
-            buffer_pool.push(Buffer { length, data });
-        }
-
+        let pool_start = unsafe { ring_start.add(slots * size_of::<BufferIndex>()) };
+        let buffer_pool = UnsafeCell::new(BufferPool::new(
+            buffer_size,
+            buffer_pool_size,
+            pool_start,
+        ));
+            
         Ok(Mapping {
             _mmap: mmap,
             registers,
+            slots,
+            ring,
             buffer_pool,
         })
     }
@@ -210,34 +216,39 @@ impl Mapping {
         let buf = mmap.as_mut_ptr();
         let registers = buf as *mut Registers;
 
-        // load the buffer size and buffer pool size
+        // load the buffer size, buffer pool size and slots
         let (
             buffer_size,
-            buffer_pool_size
+            buffer_pool_size,
+            slots
         ) = unsafe {(
             (*registers).buffer_size,
-            (*registers).buffer_pool_size
+            (*registers).buffer_pool_size,
+            (*registers).slots,
         )};
 
-        // set up the buffer pool
-        let mut ring_buffer_ptr = unsafe { buf.add(CACHE_LINE_SIZE) };
-        let mut buffer_pool = Vec::with_capacity(buffer_pool_size);
-        for _ in 0..buffer_pool_size {
-            let length = ring_buffer_ptr as *mut usize;
-            ring_buffer_ptr = unsafe {
-                ring_buffer_ptr.add(std::mem::size_of::<BufferLength>()) 
-            };
-            let data = ring_buffer_ptr;
-            ring_buffer_ptr = unsafe {
-                ring_buffer_ptr.add(buffer_size)
-            };
-
-            buffer_pool.push(Buffer { length, data });
+        // set up the ring buffer
+        let ring_start = unsafe { mmap.as_mut_ptr().add(CACHE_LINE_SIZE) };
+        let mut ring = Vec::with_capacity(slots);
+        for i in 0..slots {
+            ring.push(unsafe { 
+                ring_start.add(i * size_of::<BufferIndex>()) as *mut BufferIndex 
+            });
         }
 
+        // set up the buffer pool
+        let pool_start = unsafe { ring_start.add(slots * size_of::<BufferIndex>()) };
+        let buffer_pool = UnsafeCell::new(BufferPool::new(
+            buffer_size,
+            buffer_pool_size,
+            pool_start,
+        ));
+            
         Ok(Mapping {
             _mmap: mmap,
             registers,
+            slots,
+            ring,
             buffer_pool,
         })
     }
@@ -249,10 +260,8 @@ impl Mapping {
         // load head and tail registers
         let (head, tail) = unsafe {
             (
-                AtomicUsize::from_ptr(&mut (*self.registers).head)
-                    .load(Ordering::Acquire),
-                AtomicUsize::from_ptr(&mut (*self.registers).tail)
-                    .load(Ordering::Acquire)
+                (*self.registers).head.load(Ordering::Acquire),
+                (*self.registers).tail.load(Ordering::Acquire)
             )
         };
 
@@ -265,63 +274,45 @@ impl Mapping {
     /// Capacity of ring buffer. In other words, how many items the producer
     /// can enqueue before running out of space
     pub fn capacity(&self) -> usize {
-        // number of buffers in the pool
-        let buffer_pool_size = unsafe {
-            (*self.registers).buffer_pool_size
-        };
-
-        // number of buffers that are "used" (produced but not consumed)
-        let pending = self.pending();
-
-        // capacity is buffer pool size minus pending
-        buffer_pool_size - pending
+        self.slots - self.pending()
     }
 
     /// Bulk enqueue operation. Returns number of entries succesfully enqueued.
     /// 
-    /// If any of the entries is larger than buffer_size, it will be silently
-    /// truncated to the pool's buffer size.
-    pub fn enqueue_bulk_bytes(&self, data: &[impl AsRef<[u8]>]) -> usize {
+    /// Buffer pool is responsible for allocating multiple buffers if needed.
+    pub fn enqueue_bulk_bytes(&mut self, data: &[impl AsRef<[u8]>]) -> usize {
+        let buffer_pool = unsafe { &mut *self.buffer_pool.get() };
         // trim data to the smaller of the two (capacity or data length)
         let enqueued = data.len().min(self.capacity());
         let data = &data[..enqueued];
 
-        // get the head pointer as an AtomicUsize, buffer_pool_size, and
-        // buffer_size
-        let head = unsafe {
-            AtomicUsize::from_ptr(&mut (*self.registers).head)
-        };
-        let (buffer_size, buffer_pool_size) = unsafe {
-            (
-                (*self.registers).buffer_size,
-                (*self.registers).buffer_pool_size
-            )
-        };
-
+        // get the head pointer as an AtomicUsize
+        let head = unsafe { &(*self.registers).head };
         // get the current head value
         let head_start = head.load(Ordering::Acquire);
 
         for (data_idx, input) in data.iter().enumerate() {
             let input = input.as_ref();
 
-            // truncate input data if it's longer than the buffer size
-            let input_len = buffer_size.min(input.len());
-            let input = &input[..input_len];
-
-            // get the buffer to write to
-            let ring_idx = (head_start + data_idx) % buffer_pool_size;
-            let buffer = &self.buffer_pool[ring_idx];
-            
-            unsafe {
-                // write the length of the data into the buffer
-                buffer.length.write_volatile(input_len);
-
-                // copy the data into the buffer
-                std::ptr::copy_nonoverlapping(
-                    input.as_ptr(),
-                    buffer.data,
-                    input_len
-                );
+            // allocate buffer chain for this input
+            if let Some((buffer, buffer_idx)) = buffer_pool.alloc_chain(input.len()) {
+                // write data to buffer chain
+                if unsafe { buffer_pool.write_chain(&buffer, input) }.is_none() {
+                    println!("buffer pool write failed, no available buffer space");
+                    // write failed, release chain and skip this input
+                    buffer_pool.release_chain(&buffer);
+                    continue;
+                }
+                
+                // store buffer index in ring
+                let ring_idx = (head_start + data_idx) % self.slots;
+                unsafe {
+                    *self.ring[ring_idx] = buffer_idx as u32;
+                }
+            } else {
+                // failed to allocate chain, stop here
+                head.store(head_start + data_idx, Ordering::Release);
+                return data_idx;
             }
         }
 
@@ -333,38 +324,31 @@ impl Mapping {
     }
 
     /// Bulk dequeue operation. Returns number of entries succesfully dequeued
-    pub fn dequeue_bulk_bytes(&self, data: &mut [Vec<u8>]) -> usize {
+    pub fn dequeue_bulk_bytes(&mut self, data: &mut [Vec<u8>]) -> usize {
+        let buffer_pool = unsafe { &mut *self.buffer_pool.get() };
         // trim data to the smaller of the two (pending or data length)
         let dequeued = data.len().min(self.pending());
+        let data = &mut data[..dequeued];
 
-        // get the tail pointer as an AtomicUsize and buffer_pool_size
-        let tail = unsafe {
-            AtomicUsize::from_ptr(&mut (*self.registers).tail)
-        };
-        let buffer_pool_size = unsafe {
-            (*self.registers).buffer_pool_size
-        };
-
+        // get the tail pointer as an AtomicUsize
+        let tail = unsafe { &(*self.registers).tail };
         // get the current tail value
         let tail_start = tail.load(Ordering::Acquire);
 
         for (data_idx, output) in data.iter_mut().enumerate() {
             // get the buffer to read from
-            let ring_idx = (tail_start + data_idx) % buffer_pool_size;
-            let buffer = &self.buffer_pool[ring_idx];
-
-            // copy the data out of the buffer
+            let ring_idx = (tail_start + data_idx) % self.slots;
+            let buffer_idx = unsafe { *self.ring[ring_idx] };
+            let buffer = buffer_pool.get_buffer(buffer_idx);
+            
             unsafe {
-                // read the length of the data from the buffer (and clear it)
-                let length = buffer.length.read_volatile();
-                buffer.length.write_volatile(0);
-
-                // copy the data into the output
-                output.clear();
-                output.extend_from_slice(
-                    std::slice::from_raw_parts(buffer.data, length)
-                );
+                // copy the data out of the buffer
+                let bytes_read = buffer_pool.read_chain(&buffer, output);
+                output.truncate(bytes_read);
             }
+            
+            // release buffer chain
+            buffer_pool.release_chain(&buffer);
         }
 
         // write the new tail value as a single store after all the reads
@@ -379,13 +363,22 @@ impl Mapping {
 fn calculate_mapping_size(
     buffer_size: usize,
     buffer_pool_size: usize,
+    slots: usize,
     page_size: usize,
 ) -> usize {
     // registers are at least size of cache line
     let mut size = CACHE_LINE_SIZE;
 
-    // buffer pool is size of buffer times number of buffers
-    size += buffer_size * buffer_pool_size;
+    // ring buffer is num slots * size of buffer index
+    size += slots * size_of::<BufferIndex>();
+
+    // buffer pool size
+    size += BufferPool::calculate_mapping_size(
+        buffer_size, 
+        buffer_pool_size, 
+        PAGE_SIZE, 
+        CACHE_LINE_SIZE
+    );
 
     // round up to nearest page size
     size += page_size - (size % page_size);
@@ -406,6 +399,7 @@ impl fmt::Display for Error {
         match self {
             Error::BufferSize => write!(f, "buffer size invalid"),
             Error::BufferPoolSize => write!(f, "buffer pool size invalid"),
+            Error::NoBuffers => write!(f, "no buffers available in pool"),
             Error::Io(e) => write!(f, "I/O error: {}", e),
         }
     }
@@ -423,10 +417,11 @@ mod tests {
     /// producer and consumer logic is working as expected.
     #[test]
     fn test_single_mapping_enqueue_dequeue() {
-        let mapping = Mapping::new_create(
+        let mut mapping = Mapping::new_create(
             "/dev/shm/test_single_mapping_enqueue_dequeue",
             2048,
             16,
+            8,
         ).unwrap();
 
         let data = vec![
@@ -451,12 +446,13 @@ mod tests {
     #[test]
     fn test_dual_mapping_enqueue_dequeue() {
         // create producer + attach consumer
-        let producer = Mapping::new_create(
+        let mut producer = Mapping::new_create(
             "/dev/shm/test_dual_mapping_enqueue_dequeue_producer",
             2048,
             16,
+            8,
         ).unwrap();
-        let consumer = Mapping::new_attach(
+        let mut consumer = Mapping::new_attach(
             "/dev/shm/test_dual_mapping_enqueue_dequeue_producer",
         ).unwrap();
 
@@ -475,5 +471,63 @@ mod tests {
         for idx in 0..dequeued {
             assert_eq!(&output[idx], &data[idx]);
         }
+    }
+
+    #[test]
+    fn test_large_message() {
+        let mut mapping = Mapping::new_create(
+            "/dev/shm/test_large_message",
+            64,  
+            16,
+            8,
+        ).unwrap();
+
+        // create data larger than single buffer (64 bytes)
+        let data = vec![
+            vec![1u8; 100],
+            vec![2u8; 150],
+        ];
+        
+        println!("enqueue: {}", mapping.enqueue_bulk_bytes(&data));
+
+        let mut output = vec![vec![0u8; 1024]; 16];
+        let dequeued = mapping.dequeue_bulk_bytes(&mut output);
+        println!("dequeue: {}", dequeued);
+
+        for idx in 0..dequeued {
+            assert_eq!(&output[idx], &data[idx]);
+        }
+    }
+
+    #[test]
+    fn test_buffer_pool_exhaustion() {
+        let mut mapping = Mapping::new_create(
+            "/dev/shm/test_pool_exhaustion",
+            64,
+            4,
+            8,
+        ).unwrap();
+
+        // try to enqueue messages that would require more buffers than available
+        let data = vec![
+            // needs 2 buffers
+            vec![1u8; 100],  
+            // needs 3 buffers
+            vec![2u8; 150],  
+            // total would need 5 buffers, but pool only has 4
+        ];
+        
+        let enqueued = mapping.enqueue_bulk_bytes(&data);
+        println!("enqueued: {}", enqueued);
+        
+        // should only enqueue first message as second would exceed pool
+        assert_eq!(enqueued, 1); 
+
+        let mut output = vec![vec![0u8; 1024]; 16];
+        let dequeued = mapping.dequeue_bulk_bytes(&mut output);
+        println!("dequeue: {}", dequeued);
+
+        assert_eq!(dequeued, 1);
+        assert_eq!(&output[0], &data[0]);
     }
 }

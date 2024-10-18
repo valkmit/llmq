@@ -53,7 +53,7 @@ impl ForwardingTable {
             // get the next message from the client and break it down into
             // the topic and the body
             let rx_count = if let Some(rx) = p.rx_mapping.load().as_ref() {
-                rx.dequeue_bulk_bytes(&mut buf)
+                unsafe { &mut *rx.get().get() }.dequeue_bulk_bytes(&mut buf)
             } else {
                 0
             };
@@ -69,7 +69,7 @@ impl ForwardingTable {
                     continue;
                 };
 
-                tx.enqueue_bulk_bytes(&mut buf[..rx_count]);
+                unsafe { &mut *tx.get().get() }.enqueue_bulk_bytes(&mut buf[..rx_count]);
             }
         }
     }

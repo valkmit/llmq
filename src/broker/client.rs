@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -6,6 +7,22 @@ use tokio::sync::Mutex;
 
 use crate::queue::Mapping;
 use crate::queue::Error as MappingError;
+
+// to safely wrap UnsafeCell<Mapping>
+pub struct SyncMapping(UnsafeCell<Mapping>);
+
+unsafe impl Send for SyncMapping {}
+unsafe impl Sync for SyncMapping {}
+
+impl SyncMapping {
+    pub fn new(mapping: Mapping) -> Self {
+        SyncMapping(UnsafeCell::new(mapping))
+    }
+
+    pub fn get(&self) -> &UnsafeCell<Mapping> {
+        &self.0
+    }
+}
 
 /// Represents a client connected to the Broker. Note that this is intended
 /// to be used by the [`Broker`] internally, and not by external pubsub clients.
@@ -21,14 +38,14 @@ pub struct Client {
     /// Note that this will be the opposite of what [`ring_paths`] returns.
     /// 
     /// [`ring_paths`]: Client::ring_paths
-    pub(super) tx_mapping: ArcSwap<Option<Mapping>>,
+    pub(super) tx_mapping: ArcSwap<Option<SyncMapping>>,
 
     /// From the perspective of the broker, the rx ring.
     /// 
     /// Note that this will be the opposite of what [`ring_paths`] returns.
     /// 
     /// [`ring_paths`]: Client::ring_paths
-    pub(super) rx_mapping: ArcSwap<Option<Mapping>>,
+    pub(super) rx_mapping: ArcSwap<Option<SyncMapping>>,
 }
 
 impl Client {
@@ -59,11 +76,11 @@ impl Client {
         // set up the rx and tx rings - note that we flip client_*x_slots and
         // rx/tx, because this is the client itself informing the broker of the
         // sizes of the rings
-        let tx = Mapping::new_create(tx_path, 4096, client_rx_slots)?;
-        let rx = Mapping::new_create(rx_path, 4096, client_tx_slots)?;
+        let tx = Mapping::new_create(tx_path, 4096, client_rx_slots, client_rx_slots)?;
+        let rx = Mapping::new_create(rx_path, 4096, client_tx_slots, client_rx_slots)?;
 
-        self.tx_mapping.store(Some(tx).into());
-        self.rx_mapping.store(Some(rx).into());
+        self.tx_mapping.store(Some(SyncMapping::new(tx)).into());
+        self.rx_mapping.store(Some(SyncMapping::new(rx)).into());
         Ok(())
     }
 
