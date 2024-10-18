@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn test_single_mapping_enqueue_dequeue() {
         let mapping = Mapping::new_create(
-            "/dev/shm/test_single_mapping_enqueue_dequeue",
+            "/tmp/test_single_mapping_enqueue_dequeue",
             2048,
             16,
         ).unwrap();
@@ -452,12 +452,12 @@ mod tests {
     fn test_dual_mapping_enqueue_dequeue() {
         // create producer + attach consumer
         let producer = Mapping::new_create(
-            "/dev/shm/test_dual_mapping_enqueue_dequeue_producer",
+            "/tmp/test_dual_mapping_enqueue_dequeue_producer",
             2048,
             16,
         ).unwrap();
         let consumer = Mapping::new_attach(
-            "/dev/shm/test_dual_mapping_enqueue_dequeue_producer",
+            "/tmp/test_dual_mapping_enqueue_dequeue_producer",
         ).unwrap();
 
         let data = vec![
