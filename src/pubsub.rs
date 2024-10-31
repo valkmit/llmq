@@ -139,7 +139,27 @@ impl PubSub {
     where
         S: Into<String>,
     {
-        self.subscriptions.insert(topic.into());
+        let topic_str = topic.into();
+        if self.subscriptions.contains(&topic_str) || self.connection.is_none() {
+            return;
+        }
+
+        let add_sub_resp = self.send_control_message(
+            Request::AddSubscription(topic_str)
+        );
+        match add_sub_resp {
+            Ok(Response::AddSubscription(subs)) => {
+                self.subscriptions = subs;
+            },
+            Ok(resp) => {
+                eprintln!("Unexpected response: {:?}", resp);
+                return;
+            },
+            Err(e) => {
+                eprintln!("Failed to add subscription: {:?}", e);
+                return;
+            },
+        }
     }
 
     /// Removes a subscription that we no longer want to receive messages for.
@@ -149,7 +169,27 @@ impl PubSub {
     where
         S: Into<String>,
     {
-        self.subscriptions.remove(&topic.into());
+        let topic_str = topic.into();
+        if !self.subscriptions.contains(&topic_str) || self.connection.is_none() {
+            return;
+        }
+
+        let del_sub_resp = self.send_control_message(
+            Request::RemoveSubscription(topic_str)
+        );
+        match del_sub_resp {
+            Ok(Response::RemoveSubscription(subs)) => {
+                self.subscriptions = subs;
+            },
+            Ok(resp) => {
+                eprintln!("Unexpected response: {:?}", resp);
+                return;
+            },
+            Err(e) => {
+                eprintln!("Failed to del subscription: {:?}", e);
+                return;
+            },
+        }
     }
 
     /// Gets the topics we are subscribed to
@@ -188,7 +228,7 @@ impl PubSub {
         // we iterate over a cloned list of subscriptions so that we don't
         // run into issues with the borrow checker and invoking the mutable
         // send_control_message (and we need to clone the strings for that
-        // invokation anyway...)
+        // invocation anyway...)
         for topic in self.subscriptions.clone().into_iter() {
             self.send_control_message(Request::AddSubscription(topic))?;
         }
@@ -197,44 +237,72 @@ impl PubSub {
     }
 
     /// Enqueue a message to be sent to the broker under the given topic
-    pub fn enqueue_bytes<S>(&self, topic: S, buf: &[u8])
+    pub fn enqueue_bytes<S>(&mut self, topic: S, buf: &[u8])
     where
         S: Into<String>,
     {
-        unimplemented!();
+        let tx_mapping = match self.tx_mapping.as_mut() {
+            Some(m) => m,
+            None => return,
+        };
+
+        let topic_str = topic.into();
+        tx_mapping.enqueue_bulk_bytes(&[(topic_str, buf)]);
     }
 
     /// Enqueue a message to be sent to the broker under the given topic.
     /// 
     /// The message is serialized using bincode
-    pub fn enqueue_type<S, T>(&self, topic: S, item: T)
+    pub fn enqueue_type<S, T>(&mut self, topic: S, item: T)
     where
         S: Into<String>,
         T: serde::Serialize,
     {
-        unimplemented!();
+        let serialized = match bincode::serialize(&item) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+        self.enqueue_bytes(topic, &serialized);
     }
 
     /// Dequeue a message from the broker, returning the topic and the message
     /// in a newly-allocated Vec<u8>
-    pub fn dequeue_bytes(&self) -> (String, Vec<u8>) {
-        unimplemented!();
+    pub fn dequeue_bytes(&mut self) -> Option<(String, Vec<u8>)> {
+        let rx_mapping = self.rx_mapping.as_mut()?;
+        
+        let mut data = vec![(String::new(), Vec::new()); 1];
+        let dequeued = rx_mapping.dequeue_bulk_bytes(&mut data);
+        
+        if dequeued != 1 {
+            return None;
+        }
+        
+        Some(data.remove(0))
     }
 
     /// Dequeue a message from the broker, returning the topic and message
     /// buffer copied into the provided buffer
-    pub fn dequeue_bytes_into(&self, dst: &mut [u8]) -> (String, usize) {
-        unimplemented!();
+    pub fn dequeue_bytes_into(&mut self, dst: &mut [u8]) -> Option<(String, usize)> {
+        let (topic, msg) = self.dequeue_bytes()?;
+        
+        if dst.len() < msg.len() {
+            return None;
+        }
+        
+        dst[..msg.len()].copy_from_slice(&msg);
+        Some((topic, msg.len()))
     }
 
     /// Dequeue a message from the broker, returning the topic and the message
-    /// 
-    /// The message is deserialized using bincode
-    pub fn dequeue_type<T>(&self) -> (String, T)
+    /// deserialized using bincode
+    pub fn dequeue_type<T>(&mut self) -> Option<(String, T)>
     where
         T: serde::de::DeserializeOwned,
     {
-        unimplemented!();
+        let (topic, msg) = self.dequeue_bytes()?;
+        
+        let deserialized = bincode::deserialize(&msg).ok()?;
+        Some((topic, deserialized))
     }
 
     /// Sends a request over the control socket and waits for a response. In
@@ -304,12 +372,145 @@ impl From<MappingError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+    use serde::{Serialize, Deserialize};
+    use crate::broker::Broker;
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct TestMessage {
+        value: String,
+        count: i32,
+    }
+
+    /// Helper struct to manage broker and client setup/teardown
+    struct TestContext {
+        _broker: Arc<Broker>,
+        _broker_threads: Vec<thread::JoinHandle<()>>,
+    }
+
+    impl TestContext {
+        fn new() -> Self {
+            let broker = Arc::new(Broker::new(
+                "/tmp/llmq.sock", 
+                "/dev/shm"
+            ));
+            
+            let mut broker_threads = Vec::new();
+            
+            // spawn the control and data planes
+            broker_threads.push(thread::spawn({
+                let broker = Arc::clone(&broker);
+                move || {
+                    broker.run_control_plane_blocking();
+                }
+            }));
+
+            broker_threads.push(thread::spawn({
+                let broker = Arc::clone(&broker);
+                move || {
+                    broker.run_data_plane_blocking();
+                }
+            }));
+
+            // give broker time to spin up
+            thread::sleep(Duration::from_millis(100));
+
+            Self {
+                _broker: broker,
+                _broker_threads: broker_threads,
+            }
+        }
+
+        fn connect_clients() -> (PubSub, PubSub) {
+            let mut publisher = PubSub::default();
+            let mut subscriber = PubSub::default();
+            
+            publisher.connect().expect("Publisher failed to connect");
+            subscriber.connect().expect("Subscriber failed to connect");
+
+            (publisher, subscriber)
+        }
+    }
 
     #[test]
-    fn test_pubsub() {
-        let mut pubsub = PubSub::default();
-        pubsub.add_subscription("topic1");
+    fn test_pubsub_and_subscriptions() {
+        let _ctx = TestContext::new();
+        let (mut publisher, mut subscriber) = TestContext::connect_clients();
 
-        pubsub.connect().unwrap();
+        // messages shouldn't be received when not subscribed
+        publisher.enqueue_bytes("unsubscribed-topic", b"Should not receive this");
+        thread::sleep(Duration::from_millis(10));
+        assert!(subscriber.dequeue_bytes().is_none(), 
+            "Received message for unsubscribed topic");
+
+        // basic subscription and message reception
+        subscriber.add_subscription("test-topic");
+        publisher.enqueue_bytes("test-topic", b"Hello from test!");
+        // give broker time to poll
+        thread::sleep(Duration::from_millis(10));
+
+        if let Some((topic, msg)) = subscriber.dequeue_bytes() {
+            assert_eq!(topic, "test-topic");
+            assert_eq!(&msg, b"Hello from test!");
+        } else {
+            panic!("Failed to receive bytes message");
+        }
+
+        // test serialized type
+        let test_msg = TestMessage {
+            value: "test value".to_string(),
+            count: 42,
+        };
+        publisher.enqueue_type("test-topic", &test_msg);
+        // give broker time to poll
+        thread::sleep(Duration::from_millis(10));
+
+        if let Some((topic, received_msg)) = subscriber.dequeue_type::<TestMessage>() {
+            assert_eq!(topic, "test-topic");
+            assert_eq!(received_msg, test_msg);
+        } else {
+            panic!("Failed to receive typed message");
+        }
+
+        // test bytes_into
+        let mut buf = vec![0u8; 128];
+        publisher.enqueue_bytes("test-topic", b"Testing bytes_into");
+        // give broker time to poll
+        thread::sleep(Duration::from_millis(10));
+
+        if let Some((topic, len)) = subscriber.dequeue_bytes_into(&mut buf) {
+            assert_eq!(topic, "test-topic");
+            assert_eq!(&buf[..len], b"Testing bytes_into");
+        } else {
+            panic!("Failed to receive message into buffer");
+        }
+
+        // unsubscribe behavior
+        subscriber.del_subscription("test-topic");
+        publisher.enqueue_bytes("test-topic", b"Should not receive this after unsubscribe");
+        // give broker time to poll
+        thread::sleep(Duration::from_millis(10));
+        assert!(subscriber.dequeue_bytes().is_none(), 
+            "Received message after unsubscribing");
+
+        // multiple topic handling
+        subscriber.add_subscription("topic1");
+        subscriber.add_subscription("topic2");
+        publisher.enqueue_bytes("topic1", b"Message 1");
+        publisher.enqueue_bytes("topic2", b"Message 2");
+        publisher.enqueue_bytes("topic3", b"Should not receive");
+        // give broker time to poll
+        thread::sleep(Duration::from_millis(10));
+
+        let mut received_topics = HashSet::new();
+        while let Some((topic, _)) = subscriber.dequeue_bytes() {
+            received_topics.insert(topic);
+        }
+
+        assert!(received_topics.contains("topic1"), "Missing message from topic1");
+        assert!(received_topics.contains("topic2"), "Missing message from topic2");
+        assert!(!received_topics.contains("topic3"), "Incorrectly received message from topic3");
     }
 }

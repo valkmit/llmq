@@ -110,9 +110,9 @@ impl Client {
         subs.clear();
     }
 
-    /// Returns a copy of the set of subscriptions this client has
-    pub async fn subscriptions(&self) -> HashSet<String> {
-        self.subscriptions.lock().await.clone()
+    /// Returns a copy of the set of subscriptions this client has (blocking variant)
+    pub fn blocking_subscriptions(&self) -> HashSet<String> {
+        self.subscriptions.blocking_lock().clone()
     }
 
     /// Returns the paths for the rx and tx rings from the perspective of the

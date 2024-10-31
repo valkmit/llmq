@@ -20,17 +20,15 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures_util::{SinkExt, StreamExt};
 use log::info;
 use md5::{Md5, Digest};
-use tokio::spawn;
+use tokio::{spawn, task};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -55,9 +53,6 @@ struct Inner {
     /// Clients connected to the server - doesn't guarantee that the clients
     /// have actually established an rx/tx ring yet
     clients: Mutex<HashMap<String, Arc<Client>>>,
-
-    /// Fordwarding table needs to be rebuilt
-    forwarding_table_dirty: ArcSwap<bool>,
 
     /// Actual forwarding table that is running
     forwarding_table: ArcSwap<ForwardingTable>,
@@ -84,7 +79,6 @@ impl Broker {
                 unix_path: unix_path.into(),
                 shmem_directory: shmem_directory.into(),
                 clients: Default::default(),
-                forwarding_table_dirty: Arc::new(false).into(),
                 forwarding_table: Arc::new(ForwardingTable::default()).into(),
             }),
         }
@@ -106,18 +100,18 @@ impl Broker {
 
         let inner = self.inner.clone();
         rt.block_on(async move {
+            // remove socket if it already exists
+            if let Err(e) = std::fs::remove_file(&self.inner.unix_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    info!("Error removing existing socket: {:?}", e);
+                }
+            }
+
             // assuming we are able to bind, this means that we are the only
             // instance running
             let mut listener = UnixListenerStream::new(
                 UnixListener::bind(&self.inner.unix_path).unwrap()
             );
-
-            {
-                let inner = inner.clone();
-                spawn(async move {
-                    inner.rebuild_forwarding_table().await;
-                });
-            }
 
             loop {
                 let conn = listener.next().await;
@@ -146,40 +140,22 @@ impl Broker {
 }
 
 impl Inner {
-    /// Continuously checks if the forwarding table needs to be rebuilt
+    /// Rebuild the forwarding table
     async fn rebuild_forwarding_table(&self) {
-        loop {
-            // sleep for 100ms, then check if the forwarding table is dirty
-            // and needs to be rebuilt
-            sleep(Duration::from_millis(100)).await;
-            if **self.forwarding_table_dirty.load() {
-                // ordering is very important to avoid race conditions here.
-                // the absolute first thing we need to do, is set dirty to
-                // false
-                //
-                // if we don't do this, then we can end up in a situation where
-                // while we're rebuilding the table, another thread sets it
-                // to be dirty again, then we set dirty to false, and never
-                // end up rebuilding the table.
-                self.forwarding_table_dirty.store(false.into());
-
-                // we need to make a clone of the clients values, so that we
-                // avoid any deadlock situations as we will be locking
-                // subscriptions on each client as well
+        task::block_in_place(move || {
+            // use rcu to atomically update the forwarding table
+            self.forwarding_table.rcu(|_old_table| {
                 let clients = self.clients
-                    .lock()
-                    .await
+                    .blocking_lock()
                     .values()
                     .cloned()
                     .collect::<Vec<_>>();
 
-                // at this point it doesn't matter if another thread has set
-                // dirty = true in between the load and store lines above,
-                // because no matter what we're rebuilding the table
-                let forwarding_table = ForwardingTable::new(clients).await;
-                self.forwarding_table.store(forwarding_table.into());
-            }
-        }
+                Arc::new(
+                    ForwardingTable::blocking_new(clients)
+                )
+            });
+        })
     }
 
     /// Handles an individual connection to the control plane. Main loop that
@@ -258,13 +234,13 @@ impl Inner {
 
             Request::AddSubscription(topic) => {
                 let subs = client.add_subscription(topic).await;
-                self.forwarding_table_dirty.store(true.into());
+                self.rebuild_forwarding_table().await;
                 Ok(Response::AddSubscription(subs))
             },
 
             Request::RemoveSubscription(topic) => {
                 let subs = client.remove_subscription(topic).await;
-                self.forwarding_table_dirty.store(true.into());
+                self.rebuild_forwarding_table().await;
                 Ok(Response::RemoveSubscription(subs))
             },
         }
@@ -311,7 +287,7 @@ impl Inner {
             // as dirty. this will cause a rebuild and the last reference to
             // the client in the forwarding table to be dropped
             client.clear_subscriptions().await;
-            self.forwarding_table_dirty.store(true.into());
+            self.rebuild_forwarding_table().await;
         }
     }
 }
