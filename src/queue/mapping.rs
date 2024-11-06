@@ -280,7 +280,7 @@ impl Mapping {
     /// Bulk enqueue operation. Returns number of entries succesfully enqueued.
     /// 
     /// Buffer pool is responsible for allocating multiple buffers if needed.
-    pub fn enqueue_bulk_bytes(&mut self, data: &[impl AsRef<[u8]>]) -> usize {
+    pub fn enqueue_bulk_bytes(&mut self, data: &[(String, impl AsRef<[u8]>)]) -> usize {
         let buffer_pool = unsafe { &mut *self.buffer_pool.get() };
         // trim data to the smaller of the two (capacity or data length)
         let enqueued = data.len().min(self.capacity());
@@ -291,13 +291,24 @@ impl Mapping {
         // get the current head value
         let head_start = head.load(Ordering::Acquire);
 
-        for (data_idx, input) in data.iter().enumerate() {
-            let input = input.as_ref();
+        for (data_idx, (topic, msg)) in data.iter().enumerate() {
+            let msg = msg.as_ref();
+            let topic_bytes = topic.as_bytes();
+            let topic_len = (topic_bytes.len() as u32).to_le_bytes();
+
+            // store topic length, topic & msg
+            let total_len = std::mem::size_of::<u32>() + topic_bytes.len() + msg.len();
 
             // allocate buffer chain for this input
-            if let Some((buffer, buffer_idx)) = buffer_pool.alloc_chain(input.len()) {
+            if let Some((buffer, buffer_idx)) = buffer_pool.alloc_chain(total_len) {
+                let bufs = [
+                    &topic_len[..],
+                    topic_bytes,
+                    msg,
+                ];
+
                 // write data to buffer chain
-                if unsafe { buffer_pool.write_chain(&buffer, input) }.is_none() {
+                if unsafe { buffer_pool.write_chain(&buffer, &bufs) }.is_none() {
                     println!("buffer pool write failed, no available buffer space");
                     // write failed, release chain and skip this input
                     buffer_pool.release_chain(&buffer);
@@ -324,7 +335,7 @@ impl Mapping {
     }
 
     /// Bulk dequeue operation. Returns number of entries succesfully dequeued
-    pub fn dequeue_bulk_bytes(&mut self, data: &mut [Vec<u8>]) -> usize {
+    pub fn dequeue_bulk_bytes(&mut self, data: &mut [(String, Vec<u8>)]) -> usize {
         let buffer_pool = unsafe { &mut *self.buffer_pool.get() };
         // trim data to the smaller of the two (pending or data length)
         let dequeued = data.len().min(self.pending());
@@ -335,16 +346,28 @@ impl Mapping {
         // get the current tail value
         let tail_start = tail.load(Ordering::Acquire);
 
-        for (data_idx, output) in data.iter_mut().enumerate() {
+        for data_idx in 0..dequeued {
             // get the buffer to read from
             let ring_idx = (tail_start + data_idx) % self.slots;
             let buffer_idx = unsafe { *self.ring[ring_idx] };
             let buffer = buffer_pool.get_buffer(buffer_idx);
             
+            // copy all the data out of the buffer
+            let output = &mut data[data_idx].1;
             unsafe {
-                // copy the data out of the buffer
                 let bytes_read = buffer_pool.read_chain(&buffer, output);
+                // shrink vec to exact size read
                 output.truncate(bytes_read);
+            }
+
+            if output.len() >= std::mem::size_of::<u32>() {
+                let topic_len = u32::from_le_bytes(output[..4].try_into().unwrap()) as usize;
+                if output.len() >= 4 + topic_len {
+                    // extract topic and msg using the topic length prefix
+                    let topic = String::from_utf8_lossy(&output[4..4 + topic_len]).to_string();
+                    let msg = output[4 + topic_len..].to_vec();
+                    data[data_idx] = (topic, msg);
+                }
             }
             
             // release buffer chain
@@ -425,19 +448,19 @@ mod tests {
         ).unwrap();
 
         let data = vec![
-            [0u8; 16],
-            [1u8; 16],
-            [2u8; 16],
-            [3u8; 16],
+            ("topic.1".to_string(), vec![0u8; 16]),
+            ("topic.2".to_string(), vec![1u8; 16]),
+            ("topic.3".to_string(), vec![2u8; 16]),
+            ("topic.4".to_string(), vec![3u8; 16]),
         ];
         println!("enqueue: {}", mapping.enqueue_bulk_bytes(&data));
 
-        let mut output = vec![vec![0u8; 1024]; 16];
+        let mut output = vec![(String::new(), Vec::new()); 4];
         let dequeued = mapping.dequeue_bulk_bytes(&mut output);
         println!("dequeue: {}", dequeued);
 
         for idx in 0..dequeued {
-            assert_eq!(&output[idx], &data[idx]);
+            assert_eq!(output[idx], data[idx]);
         }
     }
 
@@ -457,19 +480,19 @@ mod tests {
         ).unwrap();
 
         let data = vec![
-            [0u8; 16],
-            [1u8; 16],
-            [2u8; 16],
-            [3u8; 16],
+            ("topic.1".to_string(), vec![0u8; 16]),
+            ("topic.2".to_string(), vec![1u8; 16]), 
+            ("topic.3".to_string(), vec![2u8; 16]),
+            ("topic.4".to_string(), vec![3u8; 16]),
         ];
         println!("enqueue: {}", producer.enqueue_bulk_bytes(&data));
 
-        let mut output = vec![vec![0u8; 1024]; 16];
+        let mut output = vec![(String::new(), Vec::new()); 4];
         let dequeued = consumer.dequeue_bulk_bytes(&mut output);
         println!("dequeue: {}", dequeued);
 
         for idx in 0..dequeued {
-            assert_eq!(&output[idx], &data[idx]);
+            assert_eq!(output[idx], data[idx]);
         }
     }
 
@@ -484,19 +507,51 @@ mod tests {
 
         // create data larger than single buffer (64 bytes)
         let data = vec![
-            vec![1u8; 100],
-            vec![2u8; 150],
+            ("large.1".to_string(), vec![1u8; 100]),
+            ("large.2".to_string(), vec![2u8; 150]),
         ];
         
         println!("enqueue: {}", mapping.enqueue_bulk_bytes(&data));
 
-        let mut output = vec![vec![0u8; 1024]; 16];
+        let mut output = vec![(String::new(), Vec::new()); 2];
         let dequeued = mapping.dequeue_bulk_bytes(&mut output);
         println!("dequeue: {}", dequeued);
 
         for idx in 0..dequeued {
-            assert_eq!(&output[idx], &data[idx]);
+            assert_eq!(output[idx], data[idx]);
         }
+    }
+
+    #[test]
+    fn test_dequeue_into_empty_vecs() {
+        let mut mapping = Mapping::new_create(
+            "/dev/shm/test_dequeue_empty_vecs",
+            64,
+            16,
+            8,
+        ).unwrap();
+
+        let data = vec![
+            ("msg.1".to_string(), b"Hello, World!".to_vec()),
+            ("msg.2".to_string(), vec![42u8; 200]),
+            ("msg.3".to_string(), b"Test".to_vec()),
+        ];
+        
+        let enqueued = mapping.enqueue_bulk_bytes(&data);
+        assert_eq!(enqueued, 3);
+
+        let mut output = vec![(String::new(), Vec::new()); 3];
+        let dequeued = mapping.dequeue_bulk_bytes(&mut output);
+        
+        assert_eq!(dequeued, 3);
+        assert_eq!(output[0], data[0]);
+        assert_eq!(output[1], data[1]);
+        assert_eq!(output[2], data[2]);
+
+        // verify message lengths
+        assert_eq!(output[0].1.len(), b"Hello, World!".len());
+        assert_eq!(output[1].1.len(), 200);
+        assert_eq!(output[2].1.len(), b"Test".len());
     }
 
     #[test]
@@ -511,9 +566,9 @@ mod tests {
         // try to enqueue messages that would require more buffers than available
         let data = vec![
             // needs 2 buffers
-            vec![1u8; 100],  
+            ("big.1".to_string(), vec![1u8; 100]),  
             // needs 3 buffers
-            vec![2u8; 150],  
+            ("big.2".to_string(), vec![2u8; 150]),  
             // total would need 5 buffers, but pool only has 4
         ];
         
@@ -523,11 +578,11 @@ mod tests {
         // should only enqueue first message as second would exceed pool
         assert_eq!(enqueued, 1); 
 
-        let mut output = vec![vec![0u8; 1024]; 16];
+        let mut output = vec![(String::new(), Vec::new()); 1];
         let dequeued = mapping.dequeue_bulk_bytes(&mut output);
         println!("dequeue: {}", dequeued);
 
         assert_eq!(dequeued, 1);
-        assert_eq!(&output[0], &data[0]);
+        assert_eq!(output[0], data[0]);
     }
 }

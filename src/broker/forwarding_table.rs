@@ -24,19 +24,18 @@ impl Default for ForwardingTable {
 }
 
 impl ForwardingTable {
-    /// Given a list of clients, builds the forwarding table
-    pub async fn new(clients: Vec<Arc<Client>>) -> Self {
+    /// Given a list of clients, builds the forwarding table (blocking variant)
+    pub fn blocking_new(clients: Vec<Arc<Client>>) -> Self {
         // build the forwarding table per topic
         let mut table = HashMap::<String, Vec<Arc<Client>>>::new();
         for client in clients.iter() {
-            for topic in client.subscriptions().await.iter() {
+            for topic in client.blocking_subscriptions().iter() {
                 let clients = table
                     .entry(topic.clone())
                     .or_insert_with(Default::default);
                 clients.push(client.clone());
             }
         }
-
         Self {
             publishers: clients,
             table,
@@ -45,7 +44,7 @@ impl ForwardingTable {
 
     /// Receives messages from publishers and forwards them to subscribers
     pub fn poll(&self) {
-        let mut buf = vec![vec![]; 16];
+        let mut buf = vec![(String::new(), Vec::new()); 16];
 
         // iterate over every client that is capable of publishing to the
         // broker...
@@ -58,18 +57,30 @@ impl ForwardingTable {
                 0
             };
 
-            // walk the list of clients that are interested in the topic
-            // and forward the message to them
-            for d in self.publishers.iter() {
-                if Arc::<Client>::ptr_eq(p, d) {
-                    continue;
-                }
-                let tx_opt = d.tx_mapping.load();
-                let Some(tx) = tx_opt.as_ref() else {
-                    continue;
+            for idx in 0..rx_count {
+                let (ref topic, ref body) = buf[idx];
+                
+                // retrieve the list of subscribers for this topic
+                let subscribers = match self.table.get(topic) {
+                    Some(subs) => subs,
+                    None => continue,
                 };
-
-                unsafe { &mut *tx.get().get() }.enqueue_bulk_bytes(&mut buf[..rx_count]);
+            
+                // walk the list of clients that are subscribed to the topic
+                // and forward the message to them
+                for d in subscribers.iter() {
+                    // skip if the publisher is trying to send to itself
+                    if Arc::<Client>::ptr_eq(p, d) {
+                        continue;
+                    }
+                    let tx_opt = d.tx_mapping.load();
+                    let Some(tx) = tx_opt.as_ref() else {
+                        continue;
+                    };
+                    
+                    unsafe { &mut *tx.get().get() }
+                        .enqueue_bulk_bytes(&[(topic.clone(), body)]);
+                }
             }
         }
     }

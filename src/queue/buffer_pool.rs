@@ -155,13 +155,18 @@ impl BufferPool {
         None
     }
 
-    /// Writes data across a chain of buffers
+    /// Writes an array of input buffers across a chain of destination buffers
     /// Returns Some(bytes_written) if all data was written successfully,
     /// or None if the provided chain didn't have enough capacity
-    pub unsafe fn write_chain(&self, head: &Buffer, data: &[u8]) -> Option<usize> {
+    pub unsafe fn write_chain(&self, head: &Buffer, bufs: &[&[u8]]) -> Option<usize> {
         let mut current: &Buffer = head;
-        let mut bytes_remaining = data.len();
+        let mut bytes_remaining: usize = bufs.iter().map(|b| b.len()).sum();
         let mut bytes_written = 0;
+
+        // which buf we are dealing with
+        let mut buf_idx = 0;
+        // read position in current buf
+        let mut buf_offset = 0;
         
         while bytes_remaining > 0 {
             // if data is already present in this buffer
@@ -170,17 +175,36 @@ impl BufferPool {
 
             // calculate how much we can write to this buffer
             let write_size = bytes_remaining.min(self.buffer_size);
-            // copy data into the current buffer
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr().add(bytes_written),
-                current.data,
-                write_size
-            );
+            // current write position in dest buffer
+            let mut buffer_written = 0;
+
+            while buffer_written < write_size && buf_idx < bufs.len() {
+                let current_buf = bufs[buf_idx];
+                let bytes_left_in_buf = current_buf.len() - buf_offset;
+                let can_write = (write_size - buffer_written).min(bytes_left_in_buf);
+
+                // copy data into current buffer
+                std::ptr::copy_nonoverlapping(
+                    current_buf.as_ptr().add(buf_offset),
+                    current.data.add(buffer_written),
+                    can_write
+                );
+
+                buffer_written += can_write;
+                buf_offset += can_write;
+
+                // move to next buf if we've consumed all of current one
+                if buf_offset == current_buf.len() {
+                    buf_idx += 1;
+                    buf_offset = 0;
+                }
+            }
+
             // update the length in the buffer header
-            (*current.header).length.store(write_size as u16, Ordering::Release);
+            (*current.header).length.store(buffer_written as u16, Ordering::Release);
             
-            bytes_written += write_size;
-            bytes_remaining -= write_size;
+            bytes_written += buffer_written;
+            bytes_remaining -= buffer_written;
             
             // move to next buffer if there's more data and more buffers
             if bytes_remaining > 0 {
@@ -198,31 +222,35 @@ impl BufferPool {
 
     /// Reads data from a chain of buffers into the provided slice
     /// Returns number of bytes read
-    pub unsafe fn read_chain(&self, head: &Buffer, data: &mut [u8]) -> usize {
+    pub unsafe fn read_chain(&self, head: &Buffer, data: &mut Vec<u8>) -> usize {
         let mut current = head;
         let mut bytes_read = 0;
         
         loop {
             let buffer_length = (*current.header).length.load(Ordering::Acquire) as usize;
+
+            // grow vec if necessary
+            if bytes_read + buffer_length > data.len() {
+                data.resize(bytes_read + buffer_length, 0);
+            }
             
             // copy data from the current buffer
             if buffer_length > 0 {
-                let read_size = buffer_length.min(data.len() - bytes_read);
                 std::ptr::copy_nonoverlapping(
                     current.data,
                     data.as_mut_ptr().add(bytes_read),
-                    read_size
+                    buffer_length
                 );
-                bytes_read += read_size;
+                bytes_read += buffer_length;
             }
             
             // move to next buffer if there is one
-            if !(*current.header).more.load(Ordering::Acquire) || bytes_read >= data.len() {
+            if !(*current.header).more.load(Ordering::Acquire) {
                 break;
             }
             current = &self.pool[(*current.header).next.load(Ordering::Acquire) as usize];
         }
-        
+
         bytes_read
     }
 
@@ -416,7 +444,7 @@ mod tests {
         let (buffer,_head_idx) = pool.alloc_chain(test_data.len()).expect("Should allocate successfully");
         
         unsafe {
-            let written = pool.write_chain(&buffer, test_data);
+            let written = pool.write_chain(&buffer, &[test_data]);
             assert_eq!(written.expect("Should successfully write bytes"), test_data.len());
             
             let mut output = vec![0u8; test_data.len()];
@@ -438,7 +466,7 @@ mod tests {
         let (buffer, _head_idx) = pool.alloc_chain(test_data.len()).expect("Should allocate successfully");
         
         unsafe {
-            let written = pool.write_chain(&buffer, test_data);
+            let written = pool.write_chain(&buffer, &[test_data]);
             assert_eq!(written.expect("Should successfully write bytes"), test_data.len());
 
             let mut output = vec![0u8; test_data.len()];
@@ -446,6 +474,37 @@ mod tests {
             
             assert_eq!(read, test_data.len());
             assert_eq!(&output, test_data);
+        }
+    }
+
+    #[test]
+    fn test_write_multiple_bufs_multi_buffer() {
+        // small buffer size to force spanning across multiple buffers
+        let buffer_size = 8;
+        let pool_size = 5;
+        let (mut pool, _backing) = create_test_pool(buffer_size, pool_size);
+        
+        // three buffers that will require multiple chain buffers to store
+        let buf1 = b"Hello Hello";       
+        let buf2 = b", testing ";
+        let buf3 = b"multiple buffers!";
+        let total_len = buf1.len() + buf2.len() + buf3.len();
+        
+        let (buffer, _) = pool.alloc_chain(total_len).expect("Should allocate buffer");
+        
+        unsafe {
+            let written = pool.write_chain(&buffer, &[buf1, buf2, buf3]);
+            assert_eq!(written.expect("Should write successfully"), total_len);
+            
+            let mut output = Vec::new();
+            let read = pool.read_chain(&buffer, &mut output);
+            
+            assert_eq!(read, total_len);
+            assert_eq!(&output, b"Hello Hello, testing multiple buffers!");
+
+            // confirm we needed multiple buffers
+            assert!((*buffer.header).more.load(Ordering::Acquire), 
+                "Should require multiple buffers");
         }
     }
 }
