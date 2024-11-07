@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::client::Client;
+use super::radix_tree::RadixTree;
 
 /// Efficient representation of where incoming messages should be forwarded to
 /// based on the message topic
@@ -9,16 +9,16 @@ pub struct ForwardingTable {
     /// List of clients that are capable of publishing messages
     publishers: Vec<Arc<Client>>,
 
-    /// Mapping of topics to clients that elected to receive them at the time
-    /// the forwarding table was created
-    table: HashMap<String, Vec<Arc<Client>>>,
+    /// Radix tree containing topic prefixes and their corresponding
+    /// subscribed clients.
+    topic_radix: RadixTree<Arc<Client>>,
 }
 
 impl Default for ForwardingTable {
     fn default() -> Self {
         Self {
             publishers: Default::default(),
-            table: Default::default(),
+            topic_radix: Default::default(),
         }
     }
 }
@@ -26,19 +26,16 @@ impl Default for ForwardingTable {
 impl ForwardingTable {
     /// Given a list of clients, builds the forwarding table (blocking variant)
     pub fn blocking_new(clients: Vec<Arc<Client>>) -> Self {
-        // build the forwarding table per topic
-        let mut table = HashMap::<String, Vec<Arc<Client>>>::new();
+        // build the tree per topic
+        let mut topic_radix = RadixTree::new();
         for client in clients.iter() {
             for topic in client.blocking_subscriptions().iter() {
-                let clients = table
-                    .entry(topic.clone())
-                    .or_insert_with(Default::default);
-                clients.push(client.clone());
+                topic_radix.insert(topic, Arc::clone(client));
             }
         }
         Self {
             publishers: clients,
-            table,
+            topic_radix,
         }
     }
 
@@ -60,19 +57,9 @@ impl ForwardingTable {
             for idx in 0..rx_count {
                 let (ref topic, ref body) = buf[idx];
                 
-                // retrieve the list of subscribers for this topic
-                let subscribers = match self.table.get(topic) {
-                    Some(subs) => subs,
-                    None => continue,
-                };
-            
                 // walk the list of clients that are subscribed to the topic
-                // and forward the message to them
-                for d in subscribers.iter() {
-                    // skip if the publisher is trying to send to itself
-                    if Arc::<Client>::ptr_eq(p, d) {
-                        continue;
-                    }
+                // prefix and forward the message to them
+                for d in self.topic_radix.find(topic) {
                     let tx_opt = d.tx_mapping.load();
                     let Some(tx) = tx_opt.as_ref() else {
                         continue;
