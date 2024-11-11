@@ -253,12 +253,12 @@ impl PubSub {
     /// Enqueue a message to be sent to the broker under the given topic.
     /// 
     /// The message is serialized using bincode
-    pub fn enqueue_type<S, T>(&mut self, topic: S, item: T)
+    pub fn enqueue_type<S, T>(&mut self, topic: S, item: &T)
     where
         S: Into<String>,
         T: serde::Serialize,
     {
-        let serialized = match bincode::serialize(&item) {
+        let serialized = match bincode::serialize(item) {
             Ok(bytes) => bytes,
             Err(_) => return,
         };
