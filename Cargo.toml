@@ -23,3 +23,10 @@ serde = { version = "1.0.213", features = ["derive"] }
 tokio = { version = "1.40.0", features = ["rt-multi-thread", "net", "macros"] }
 tokio-stream = { version = "0.1.16", features = ["net"] }
 tokio-util = { version = "0.7.12", features = ["io", "codec"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "pubsub"
+harness = false
