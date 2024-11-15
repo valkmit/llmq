@@ -41,26 +41,20 @@ impl ForwardingTable {
 
     /// Receives messages from publishers and forwards them to subscribers
     pub fn poll(&self) {
-        let mut buf = vec![(Some(String::new()), Vec::new()); 16];
-        let mut refs: Vec<(Option<&mut String>, &mut Vec<u8>)> = buf.iter_mut()
-            .map(|(t, p)| (t.as_mut(), p))
-            .collect();
-
-
         // iterate over every client that is capable of publishing to the
         // broker...
         for p in self.publishers.iter() {
             // get the next message from the client and break it down into
             // the topic and the body
+            let mut buf = vec![(String::new(), Vec::new()); 16];
             let rx_count = if let Some(rx) = p.rx_mapping.load().as_ref() {
-                unsafe { &mut *rx.get().get() }.dequeue_bulk_bytes(&mut refs, true)
+                unsafe { &mut *rx.get().get() }.dequeue_bulk_bytes(&mut buf, true)
             } else {
                 0
             };
 
             for idx in 0..rx_count {
-                let (topic_opt, body) = &refs[idx];
-                let Some(topic) = topic_opt else { continue };
+                let (topic, body) = &buf[idx];
                 
                 // walk the list of clients that are subscribed to the topic
                 // prefix and forward the message to them

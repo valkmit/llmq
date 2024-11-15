@@ -74,14 +74,11 @@ pub struct PubSub {
     /// Attached mapping to the tx rings set up by the broker
     tx_mapping: Option<Mapping>,
 
-    /// Reusable buffer for serialization
-    serialize_buf: Vec<u8>,
+    /// Reusable buffers for serialization
+    serialize_bufs: Vec<Vec<u8>>,
 
-    /// Reusable buffer for dequeue payloads
-    dequeue_buf: Vec<u8>,
-
-    /// Reusable string for dequeue topics
-    dequeue_topic: String,
+    /// Reusable buffers for dequeues
+    dequeue_bufs: Vec<(String, Vec<u8>)>,
 }
 
 /// Default UNIX socket path the broker control socket listens on
@@ -137,9 +134,8 @@ impl PubSub {
             connection: None,
             rx_mapping: None,
             tx_mapping: None,
-            serialize_buf: Vec::new(),
-            dequeue_buf: Vec::new(),
-            dequeue_topic: String::new(),
+            serialize_bufs: Vec::new(),
+            dequeue_bufs: Vec::new(),
         }
     }
 
@@ -261,6 +257,20 @@ impl PubSub {
         tx_mapping.enqueue_bulk_bytes(&[(topic.as_ref(), buf)]);
     }
 
+    /// Enqueue messages to be sent to the broker under the given topic
+    pub fn enqueue_bulk_bytes<S, B>(&mut self, items: &[(S, B)])
+    where
+       S: AsRef<str>,
+       B: AsRef<[u8]>,
+    {
+       let tx_mapping = match self.tx_mapping.as_mut() {
+           Some(m) => m,
+           None => return,
+       };
+    
+       tx_mapping.enqueue_bulk_bytes(items);
+    }
+
     /// Enqueue a message to be sent to the broker under the given topic.
     /// 
     /// The message is serialized using bincode
@@ -274,45 +284,100 @@ impl PubSub {
             None => return,
         };
 
-        self.serialize_buf.clear();
-        match bincode::serialize_into(&mut self.serialize_buf, item) {
-            Ok(()) => tx_mapping.enqueue_bulk_bytes(&[(topic.as_ref(), &self.serialize_buf)]),
+        if self.serialize_bufs.is_empty() {
+            self.serialize_bufs.push(Vec::new());
+        }
+
+        self.serialize_bufs[0].clear();
+        match bincode::serialize_into(&mut self.serialize_bufs[0], item) {
+            Ok(()) => tx_mapping.enqueue_bulk_bytes(&[(topic.as_ref(), &self.serialize_bufs[0])]),
             Err(_) => return,
         };
     }
 
-    /// Dequeue a message from the broker, returning the topic and the message
-    /// in a newly-allocated Vec<u8>
-    pub fn dequeue_bytes(&mut self) -> Option<(&str, &[u8])> {
-        let rx_mapping = self.rx_mapping.as_mut()?;
-        
-        self.dequeue_topic.clear();
-        self.dequeue_buf.clear();
-        
-        let mut data = [(Some(&mut self.dequeue_topic), &mut self.dequeue_buf)];
-        let dequeued = rx_mapping.dequeue_bulk_bytes(&mut data, true);
-        
-        if dequeued != 1 {
-            return None;
+    /// Enqueue multiple messages to be sent to the broker under their respective topics.
+    /// 
+    /// Each message is serialized using bincode. The messages are provided as
+    /// tuples of (topic, item).
+    pub fn enqueue_bulk_type<S, T>(&mut self, items: &[(S, T)])
+    where
+        S: AsRef<str>,
+        T: serde::Serialize,
+    {
+        let tx_mapping = match self.tx_mapping.as_mut() {
+            Some(m) => m,
+            None => return,
+        };
+
+        // resize buffer vec if needed
+        if self.serialize_bufs.len() < items.len() {
+            self.serialize_bufs.resize_with(items.len(), Vec::new);
+        }
+
+        for (i, (_, item)) in items.iter().enumerate() {
+            let buf = &mut self.serialize_bufs[i];
+            buf.clear();
+            if bincode::serialize_into(buf, item).is_err() {
+                return;
+            }
+        }
+
+        let pairs: Vec<(&str, &[u8])> = items.iter()
+            .zip(self.serialize_bufs.iter())
+            .map(|((topic, _), data)| (topic.as_ref(), data.as_slice()))
+            .collect();
+
+        tx_mapping.enqueue_bulk_bytes(&pairs);
+    }
+
+    /// Dequeue multiple messages from the broker, returning vec of (topic, payload) tuples.
+    /// Returns empty vec if no messages were dequeued.
+    pub fn dequeue_bulk_bytes(&mut self, count: usize) -> &[(String, Vec<u8>)] {
+        let rx_mapping = match self.rx_mapping.as_mut() {
+            Some(m) => m,
+            None => return &[],
+        };
+    
+        // ensure tmp buffers are big enough
+        if self.dequeue_bufs.len() < count {
+            self.dequeue_bufs.resize_with(count, || (String::new(), Vec::new()));
         }
         
-        Some((&self.dequeue_topic, &self.dequeue_buf))
+        // clear tmp buffers
+        for (topic, buf) in &mut self.dequeue_bufs[..count] {
+            topic.clear();
+            buf.clear();
+        }
+    
+        let dequeued = rx_mapping.dequeue_bulk_bytes(&mut self.dequeue_bufs[..count], true);
+        &self.dequeue_bufs[..dequeued]
+    }
+
+    /// Dequeue a message from the broker, returning the topic and the message
+    /// in a newly-allocated Vec<u8>
+    pub fn dequeue_bytes(&mut self) -> Option<&(String, Vec<u8>)> {
+        self.dequeue_bulk_bytes(1).get(0)  
     }
 
     /// Dequeue a message from the broker, returning just the message payload
     /// without allocating memory for the topic string
-    pub fn dequeue_bytes_no_topic(&mut self) -> Option<&[u8]> {
+    pub fn dequeue_bytes_no_topic(&mut self) -> Option<&Vec<u8>> {
         let rx_mapping = self.rx_mapping.as_mut()?;
+   
+        if self.dequeue_bufs.is_empty() {
+            self.dequeue_bufs.push((String::new(), Vec::new()));
+        }
         
-        self.dequeue_buf.clear();
-        let mut data = [(None, &mut self.dequeue_buf)];
-        let dequeued = rx_mapping.dequeue_bulk_bytes(&mut data, false);
+        self.dequeue_bufs.truncate(1);
+        let (_, buf) = &mut self.dequeue_bufs[0];
+        buf.clear();
         
+        let dequeued = rx_mapping.dequeue_bulk_bytes(&mut self.dequeue_bufs, false);
         if dequeued != 1 {
             return None;
         }
         
-        Some(&self.dequeue_buf)
+        Some(&self.dequeue_bufs[0].1)
     }
 
     /// Dequeue a message from the broker, returning the topic and message
@@ -338,6 +403,25 @@ impl PubSub {
         
         let deserialized = bincode::deserialize(&msg).ok()?;
         Some((topic, deserialized))
+    }
+
+    /// Dequeue multiple messages from the broker and deserialize them.
+    /// Returns vec of (topic, deserialized_message) tuples.
+    /// Messages that fail to deserialize are skipped.
+    pub fn dequeue_bulk_type<T>(&mut self, count: usize) -> Vec<(&str, T)>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let bytes = self.dequeue_bulk_bytes(count);
+        
+        bytes.into_iter()
+            .filter_map(|(topic, data)| {
+                match bincode::deserialize(data) {
+                    Ok(msg) => Some((topic.as_str(), msg)),
+                    Err(_) => None,
+                }
+            })
+            .collect()
     }
 
     /// Sends a request over the control socket and waits for a response. In
@@ -419,7 +503,7 @@ mod tests {
         count: i32,
     }
 
-    /// Helper struct to manage broker and client setup/teardown
+    /// helper struct to manage broker and client setup/teardown
     struct TestContext {
         _broker: Arc<Broker>,
         _broker_threads: Vec<thread::JoinHandle<()>>,
@@ -488,7 +572,7 @@ mod tests {
 
         if let Some((topic, msg)) = subscriber.dequeue_bytes() {
             assert_eq!(topic, "test-topic");
-            assert_eq!(&msg, b"Hello from test!");
+            assert_eq!(msg, b"Hello from test!");
         } else {
             panic!("Failed to receive bytes message");
         }

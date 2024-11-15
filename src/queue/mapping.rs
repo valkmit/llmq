@@ -341,13 +341,12 @@ impl Mapping {
     /// Bulk dequeue operation. Returns number of entries succesfully dequeued
     pub fn dequeue_bulk_bytes<'a>(
         &mut self,
-        data: &mut [(Option<&'a mut String>, &'a mut Vec<u8>)],
+        data: &mut [(String, Vec<u8>)],
         copy_topic: bool,
     ) -> usize {
         let buffer_pool = unsafe { &mut *self.buffer_pool.get() };
         // trim data to the smaller of the two (pending or data length)
         let dequeued = data.len().min(self.pending());
-        let data = &mut data[..dequeued];
 
         // get the tail pointer as an AtomicUsize
         let tail = unsafe { &(*self.registers).tail };
@@ -361,7 +360,7 @@ impl Mapping {
             let buffer = buffer_pool.get_buffer(buffer_idx);
             
             // copy all the data out of the buffer
-            let output = &mut data[data_idx].1;
+            let (topic, output)= &mut data[data_idx];
             output.clear();
             unsafe {
                 let bytes_read = buffer_pool.read_chain(&buffer, output);
@@ -374,13 +373,9 @@ impl Mapping {
                 if output.len() >= 4 + topic_len {
                     if copy_topic {
                         // extract topic and msg using the topic length prefix
-                        if let Some(topic_str) = &mut data[data_idx].0 {
-                            topic_str.clear();
-                            topic_str.push_str(std::str::from_utf8(&output[4..4 + topic_len])
-                                .expect("Invalid UTF-8 in topic"));
-                        }
-                    } else {
-                        data[data_idx].0 = None;
+                        topic.clear();
+                        topic.push_str(std::str::from_utf8(&output[4..4 + topic_len])
+                            .expect("Invalid UTF-8 in topic"));
                     }
                     let payload_start = 4 + topic_len;
                     output.copy_within(payload_start.., 0);
@@ -473,19 +468,12 @@ mod tests {
         ];
         println!("enqueue: {}", mapping.enqueue_bulk_bytes(&data));
 
-        let mut topics = vec![String::new(); 4];
-        let mut payloads = vec![Vec::new(); 4];
-        let mut refs: Vec<(Option<&mut String>, &mut Vec<u8>)> = topics.iter_mut()
-            .zip(payloads.iter_mut())
-            .map(|(t, p)| (Some(t), p))
-            .collect();
-
-        let dequeued = mapping.dequeue_bulk_bytes(&mut refs, true);
+        let mut received = vec![(String::new(), Vec::new()); 4];
+        let dequeued = mapping.dequeue_bulk_bytes(&mut received, true);
         println!("dequeue: {}", dequeued);
 
         for idx in 0..dequeued {
-            assert_eq!(&topics[idx], &data[idx].0);
-            assert_eq!(&payloads[idx], &data[idx].1);
+            assert_eq!(&received[idx], &data[idx]);
         }
     }
 
@@ -512,19 +500,12 @@ mod tests {
         ];
         println!("enqueue: {}", producer.enqueue_bulk_bytes(&data));
 
-        let mut topics = vec![String::new(); 4];
-        let mut payloads = vec![Vec::new(); 4];
-        let mut refs: Vec<(Option<&mut String>, &mut Vec<u8>)> = topics.iter_mut()
-            .zip(payloads.iter_mut())
-            .map(|(t, p)| (Some(t), p))
-            .collect();
-
-        let dequeued = consumer.dequeue_bulk_bytes(&mut refs, true);
+        let mut received = vec![(String::new(), Vec::new()); 4];
+        let dequeued = consumer.dequeue_bulk_bytes(&mut received, true);
         println!("dequeue: {}", dequeued);
 
         for idx in 0..dequeued {
-            assert_eq!(&topics[idx], &data[idx].0);
-            assert_eq!(&payloads[idx], &data[idx].1);
+            assert_eq!(&received[idx], &data[idx]);
         }
     }
 
@@ -545,19 +526,12 @@ mod tests {
         
         println!("enqueue: {}", mapping.enqueue_bulk_bytes(&data));
 
-        let mut topics = vec![String::new(); 2];
-        let mut payloads = vec![Vec::new(); 2];
-        let mut refs: Vec<(Option<&mut String>, &mut Vec<u8>)> = topics.iter_mut()
-            .zip(payloads.iter_mut())
-            .map(|(t, p)| (Some(t), p))
-            .collect();
-
-        let dequeued = mapping.dequeue_bulk_bytes(&mut refs, true);
+        let mut received = vec![(String::new(), Vec::new()); 2];
+        let dequeued = mapping.dequeue_bulk_bytes(&mut received, true);
         println!("dequeue: {}", dequeued);
 
         for idx in 0..dequeued {
-            assert_eq!(&topics[idx], &data[idx].0);
-            assert_eq!(&payloads[idx], &data[idx].1);
+            assert_eq!(&received[idx], &data[idx]);
         }
     }
 
@@ -579,24 +553,17 @@ mod tests {
         let enqueued = mapping.enqueue_bulk_bytes(&data);
         assert_eq!(enqueued, 3);
 
-        let mut topics = vec![String::new(); 3];
-        let mut payloads = vec![Vec::new(); 3];
-        let mut refs: Vec<(Option<&mut String>, &mut Vec<u8>)> = topics.iter_mut()
-            .zip(payloads.iter_mut())
-            .map(|(t, p)| (Some(t), p))
-            .collect();
-
-        let dequeued = mapping.dequeue_bulk_bytes(&mut refs, true);
+        let mut received = vec![(String::new(), Vec::new()); 3];
+        let dequeued = mapping.dequeue_bulk_bytes(&mut received, true);
         assert_eq!(dequeued, 3);
 
         for idx in 0..dequeued {
-            assert_eq!(&topics[idx], &data[idx].0);
-            assert_eq!(&payloads[idx], &data[idx].1);
+            assert_eq!(&received[idx], &data[idx]);
         }
 
-        assert_eq!(payloads[0].len(), b"Hello, World!".len());
-        assert_eq!(payloads[1].len(), 200);
-        assert_eq!(payloads[2].len(), b"Test".len());
+        assert_eq!(received[0].1.len(), b"Hello, World!".len());
+        assert_eq!(received[1].1.len(), 200);
+        assert_eq!(received[2].1.len(), b"Test".len());
     }
 
     #[test]
@@ -623,19 +590,12 @@ mod tests {
         // should only enqueue first message as second would exceed pool
         assert_eq!(enqueued, 1); 
 
-        let mut topics = vec![String::new(); 1];
-        let mut payloads = vec![Vec::new(); 1];
-        let mut refs: Vec<(Option<&mut String>, &mut Vec<u8>)> = topics.iter_mut()
-            .zip(payloads.iter_mut())
-            .map(|(t, p)| (Some(t), p))
-            .collect();
-
-        let dequeued = mapping.dequeue_bulk_bytes(&mut refs, true);
+        let mut received = vec![(String::new(), Vec::new()); 1];
+        let dequeued = mapping.dequeue_bulk_bytes(&mut received, true);
         println!("dequeue: {}", dequeued);
         assert_eq!(dequeued, 1);
 
-        assert_eq!(&topics[0], &data[0].0);
-        assert_eq!(&payloads[0], &data[0].1);
+        assert_eq!(&received[0], &data[0]);
     }
 
     #[test]
@@ -653,16 +613,12 @@ mod tests {
         ];
         println!("enqueue: {}", mapping.enqueue_bulk_bytes(&data));
 
-        let mut payloads = vec![Vec::new(); 2];
-        let mut refs: Vec<(Option<&mut String>, &mut Vec<u8>)> = payloads.iter_mut()
-            .map(|p| (None, p))
-            .collect();
-
-        let dequeued = mapping.dequeue_bulk_bytes(&mut refs, false);
+        let mut received = vec![(String::new(), Vec::new()); 2];
+        let dequeued = mapping.dequeue_bulk_bytes(&mut received, false);
         println!("dequeue: {}", dequeued);
 
         for idx in 0..dequeued {
-            assert_eq!(&payloads[idx], &data[idx].1);
+            assert_eq!(&received[idx].1, &data[idx].1);
         }
     }
 }
