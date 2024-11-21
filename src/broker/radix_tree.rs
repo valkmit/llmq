@@ -193,8 +193,8 @@ mod tests {
         tree.insert("abcdefghijklmnop", 1);
         tree.insert("abcdefghijklmnoz", 2);  
 
-        assert_eq!(tree.find("p"), vec![]);
-        assert_eq!(tree.find("z"), vec![]);
+        assert_eq!(tree.find("p").is_empty(), true);
+        assert_eq!(tree.find("z").is_empty(), true);
 
         tree.insert("abcdefghijk", 3);
         tree.insert("abcdefgh", 4);

@@ -12,6 +12,16 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
+use rkyv::{Archive, Archived, Portable, Serialize};
+use rkyv::bytecheck::CheckBytes;
+use rkyv::ser::allocator::ArenaHandle;
+use rkyv::ser::sharing::Share;
+use rkyv::ser::Serializer;
+use rkyv::util::AlignedVec;
+use rkyv::validation::archive::ArchiveValidator;
+use rkyv::validation::shared::SharedValidator;
+use rkyv::validation::Validator;
+use rkyv::rancor::{Error as RkyvError, Strategy};
 use tokio_util::bytes::BytesMut;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -273,11 +283,11 @@ impl PubSub {
 
     /// Enqueue a message to be sent to the broker under the given topic.
     /// 
-    /// The message is serialized using bincode
+    /// The message is serialized using rkyv
     pub fn enqueue_type<S, T>(&mut self, topic: S, item: &T)
     where
         S: AsRef<str>,
-        T: serde::Serialize,
+        T: for<'a> Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, RkyvError>>,
     {
         let tx_mapping = match self.tx_mapping.as_mut() {
             Some(m) => m,
@@ -289,20 +299,20 @@ impl PubSub {
         }
 
         self.serialize_bufs[0].clear();
-        match bincode::serialize_into(&mut self.serialize_bufs[0], item) {
-            Ok(()) => tx_mapping.enqueue_bulk_bytes(&[(topic.as_ref(), &self.serialize_bufs[0])]),
+        match rkyv::to_bytes::<RkyvError>(item) {
+            Ok(bytes) => tx_mapping.enqueue_bulk_bytes(&[(topic.as_ref(), &bytes)]),
             Err(_) => return,
         };
     }
 
     /// Enqueue multiple messages to be sent to the broker under their respective topics.
     /// 
-    /// Each message is serialized using bincode. The messages are provided as
+    /// Each message is serialized using rkyv. The messages are provided as
     /// tuples of (topic, item).
     pub fn enqueue_bulk_type<S, T>(&mut self, items: &[(S, T)])
     where
         S: AsRef<str>,
-        T: serde::Serialize,
+        T: for<'a> Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, RkyvError>>,
     {
         let tx_mapping = match self.tx_mapping.as_mut() {
             Some(m) => m,
@@ -317,7 +327,7 @@ impl PubSub {
         for (i, (_, item)) in items.iter().enumerate() {
             let buf = &mut self.serialize_bufs[i];
             buf.clear();
-            if bincode::serialize_into(buf, item).is_err() {
+            if rkyv::to_bytes::<RkyvError>(item).map(|bytes| buf.extend_from_slice(&bytes)).is_err() {
                 return;
             }
         }
@@ -394,30 +404,38 @@ impl PubSub {
     }
 
     /// Dequeue a message from the broker, returning the topic and the message
-    /// deserialized using bincode
-    pub fn dequeue_type<T>(&mut self) -> Option<(&str, T)>
+    /// reference zero-copy archived using rkyv
+    pub fn dequeue_type<T>(&mut self) -> Option<(&str, &Archived<T>)>
     where
-        T: serde::de::DeserializeOwned,
+        T: Archive,
+        T::Archived: Portable + for<'a> CheckBytes<Strategy<
+            Validator<ArchiveValidator<'a>, SharedValidator>,
+            RkyvError
+        >>,
     {
-        let (topic, msg) = self.dequeue_bytes()?;
+        let (topic, buf) = self.dequeue_bytes()?;
         
-        let deserialized = bincode::deserialize(&msg).ok()?;
-        Some((topic, deserialized))
+        let archived = rkyv::access::<Archived<T>, RkyvError>(&buf).ok()?;
+        Some((topic, archived))
     }
 
     /// Dequeue multiple messages from the broker and deserialize them.
     /// Returns vec of (topic, deserialized_message) tuples.
     /// Messages that fail to deserialize are skipped.
-    pub fn dequeue_bulk_type<T>(&mut self, count: usize) -> Vec<(&str, T)>
+    pub fn dequeue_bulk_type<T>(&mut self, count: usize) -> Vec<(&str, &Archived<T>)>
     where
-        T: serde::de::DeserializeOwned,
+        T: Archive,
+        T::Archived: Portable + for<'a> CheckBytes<Strategy<
+            Validator<ArchiveValidator<'a>, SharedValidator>,
+            RkyvError
+        >>,
     {
         let bytes = self.dequeue_bulk_bytes(count);
         
-        bytes.into_iter()
+        bytes.iter()
             .filter_map(|(topic, data)| {
-                match bincode::deserialize(data) {
-                    Ok(msg) => Some((topic.as_str(), msg)),
+                match rkyv::access::<rkyv::Archived<T>, RkyvError>(data) {
+                    Ok(archived) => Some((topic.as_str(), archived)),
                     Err(_) => None,
                 }
             })
@@ -491,13 +509,17 @@ impl From<MappingError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rkyv::Deserialize;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
-    use serde::{Serialize, Deserialize};
     use crate::broker::Broker;
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Archive, Deserialize, Serialize, Clone, Debug, PartialEq)]
+    #[rkyv(
+        compare(PartialEq),
+        derive(Debug),
+    )]
     struct TestMessage {
         value: String,
         count: i32,
@@ -586,9 +608,16 @@ mod tests {
         // give broker time to poll
         thread::sleep(Duration::from_millis(10));
 
-        if let Some((topic, received_msg)) = subscriber.dequeue_type::<TestMessage>() {
+        if let Some((topic, archived_msg)) = subscriber.dequeue_type::<TestMessage>() {
             assert_eq!(topic, "test-topic");
-            assert_eq!(received_msg, test_msg);
+            // check archived equality
+            assert_eq!(*archived_msg, test_msg);
+
+            let deserialized: TestMessage = rkyv::deserialize::<TestMessage, RkyvError>(
+                archived_msg
+            ).unwrap();
+            // check original type equality
+            assert_eq!(deserialized, test_msg);
         } else {
             panic!("Failed to receive typed message");
         }

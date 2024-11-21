@@ -6,14 +6,19 @@ use criterion::{
     Criterion
 };
 use llmq::{Broker, PubSub};
+use rkyv::{Archive, Deserialize, Serialize};
+use rkyv::rancor::Error as RkyvError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use serde::{Serialize, Deserialize};
 
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+#[rkyv(
+    compare(PartialEq),
+    derive(Debug),
+)]
 struct BenchMessage {
     payload: Vec<u8>,
     sequence: u64,
@@ -127,7 +132,7 @@ fn enqueue_bulk_type_throughput_benchmark(c: &mut Criterion) {
                     }; batch_size];
                     
                     let msgs: Vec<_> = messages.iter()
-                        .map(|msg| ("bench-topic", msg))
+                        .map(|msg| ("bench-topic", msg.clone()))
                         .collect();
                     
                     b.iter(|| {
@@ -267,7 +272,7 @@ fn dequeue_type_throughput_benchmark(c: &mut Criterion) {
                 let publish_thread = thread::spawn(move || {
                     // serialize one time and call enqueue_bytes directly 
                     // so enqueue is speedy
-                    let bytes = bincode::serialize(&msg).unwrap();
+                    let bytes = rkyv::to_bytes::<RkyvError>(&msg).unwrap();
                     while thread_running.load(Ordering::Relaxed) {
                         publisher.lock().unwrap().enqueue_bytes("bench-topic", &bytes);
                     }
@@ -321,7 +326,7 @@ fn dequeue_bulk_type_throughput_benchmark(c: &mut Criterion) {
                     let publish_thread = thread::spawn(move || {
                         // serialize one time and call enqueue_bytes directly 
                         // so enqueue is speedy
-                        let bytes = bincode::serialize(&msg).unwrap();
+                        let bytes = rkyv::to_bytes::<RkyvError>(&msg).unwrap();
                         while thread_running.load(Ordering::Relaxed) {
                             let msgs: Vec<_> = (0..batch_size)
                                 .map(|_| ("bench-topic", &bytes[..]))

@@ -19,6 +19,9 @@ log = "0.4.22"
 md-5 = "0.10.6"
 memmap = "0.7.0"
 rand = "0.8.5"
+# default features of rkyv, explicitly enabled per documentation recommendation
+# https://docs.rs/rkyv/latest/rkyv/ 
+rkyv = { version = "0.8.8", features = ["std", "alloc", "bytecheck", "little_endian", "aligned", "pointer_width_32"]}
 serde = { version = "1.0.213", features = ["derive"] }
 tokio = { version = "1.40.0", features = ["rt-multi-thread", "net", "macros"] }
 tokio-stream = { version = "0.1.16", features = ["net"] }
@@ -29,4 +32,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
 name = "pubsub"
+harness = false
+
+[[bench]]
+name = "rkyv"
 harness = false
