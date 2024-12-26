@@ -23,7 +23,7 @@ rand = "0.8.5"
 # https://docs.rs/rkyv/latest/rkyv/ 
 rkyv = { version = "0.8.8", features = ["std", "alloc", "bytecheck", "little_endian", "aligned", "pointer_width_32"]}
 serde = { version = "1.0.213", features = ["derive"] }
-tokio = { version = "1.40.0", features = ["rt-multi-thread", "net", "macros"] }
+tokio = { version = "1.40.0", features = ["rt-multi-thread", "net", "macros", "time"] }
 tokio-stream = { version = "0.1.16", features = ["net"] }
 tokio-util = { version = "0.7.12", features = ["io", "codec"] }
 

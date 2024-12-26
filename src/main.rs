@@ -5,7 +5,6 @@ pub mod pubsub;
 mod queue;
 
 use std::{env, thread};
-use std::sync::Arc;
 
 use flexi_logger::{colored_with_thread, Logger, WriteMode};
 use log::info;
@@ -30,18 +29,18 @@ fn main() {
         .unwrap_or_else(|_| "/tmp/llmq.sock".to_string());
     let shmem_directory = env::var("SHMEM_DIRECTORY")
         .unwrap_or_else(|_| "/dev/shm".to_string());
-    let broker = Arc::new(Broker::new(unix_path, shmem_directory));
+    let broker = Broker::new(unix_path, shmem_directory);
 
     // spawn the control and data planes
     thread::spawn({
-        let broker = Arc::clone(&broker);
+        let broker = broker.clone();
         move || {
             broker.run_control_plane_blocking();
         }
     });
     info!("Control plane started");
     thread::spawn({
-        let broker = Arc::clone(&broker);
+        let broker = broker.clone();
         move || {
             broker.run_data_plane_blocking();
         }

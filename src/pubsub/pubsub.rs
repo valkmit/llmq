@@ -31,6 +31,7 @@ use crate::adapter::serde::{
     TypeToBytes,
     HEADER_SIZE,
 };
+use super::asynchronous::{EnqueueBulkFuture, DequeueBulkFuture};
 use crate::protocol::control::{Response, Request};
 use crate::queue::Mapping;
 use crate::queue::Error as MappingError;
@@ -79,16 +80,16 @@ pub struct PubSub {
     connection: Option<UnixStream>,
 
     /// Attached mapping to the rx rings set up by the broker
-    rx_mapping: Option<Mapping>,
+    pub(crate) rx_mapping: Option<Mapping>,
 
     /// Attached mapping to the tx rings set up by the broker
-    tx_mapping: Option<Mapping>,
+    pub(crate) tx_mapping: Option<Mapping>,
 
     /// Reusable buffers for serialization
     serialize_bufs: Vec<Vec<u8>>,
 
     /// Reusable buffers for dequeues
-    dequeue_bufs: Vec<(String, Vec<u8>)>,
+    pub(crate) dequeue_bufs: Vec<(String, Vec<u8>)>,
 }
 
 /// Default UNIX socket path the broker control socket listens on
@@ -267,6 +268,20 @@ impl PubSub {
         tx_mapping.enqueue_bulk_bytes(&[(topic.as_ref(), buf)]);
     }
 
+    pub fn enqueue_bulk_bytes_async<'a, S, B>(
+        &'a mut self,
+        items: &'a [(S, B)]
+    ) -> EnqueueBulkFuture<'a, S, B> 
+    where
+        S: AsRef<str>,
+        B: AsRef<[u8]>,
+    {
+        EnqueueBulkFuture {
+            pubsub: self,
+            items,
+        }
+    }
+
     /// Enqueue messages to be sent to the broker under the given topic
     pub fn enqueue_bulk_bytes<S, B>(&mut self, items: &[(S, B)])
     where
@@ -361,6 +376,13 @@ impl PubSub {
     
         let dequeued = rx_mapping.dequeue_bulk_bytes(&mut self.dequeue_bufs[..count], true);
         &self.dequeue_bufs[..dequeued]
+    }
+
+    pub fn dequeue_bulk_bytes_async(&mut self, count: usize) -> DequeueBulkFuture {
+        DequeueBulkFuture {
+            pubsub: self,
+            count,
+        }
     }
 
     /// Dequeue a message from the broker, returning the topic and the message
@@ -509,76 +531,14 @@ impl From<MappingError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rkyv::Deserialize;
-    use std::sync::Arc;
+    use crate::pubsub::test_helpers::*;
     use std::thread;
     use std::time::Duration;
-    use crate::broker::Broker;
-
-    #[derive(Archive, Deserialize, Serialize, Clone, Debug, PartialEq)]
-    #[rkyv(
-        compare(PartialEq),
-        derive(Debug),
-    )]
-    struct TestMessage {
-        value: String,
-        count: i32,
-    }
-
-    /// helper struct to manage broker and client setup/teardown
-    struct TestContext {
-        _broker: Arc<Broker>,
-        _broker_threads: Vec<thread::JoinHandle<()>>,
-    }
-
-    impl TestContext {
-        fn new() -> Self {
-            let broker = Arc::new(Broker::new(
-                "/tmp/llmq.sock", 
-                "/dev/shm"
-            ));
-            
-            let mut broker_threads = Vec::new();
-            
-            // spawn the control and data planes
-            broker_threads.push(thread::spawn({
-                let broker = Arc::clone(&broker);
-                move || {
-                    broker.run_control_plane_blocking();
-                }
-            }));
-
-            broker_threads.push(thread::spawn({
-                let broker = Arc::clone(&broker);
-                move || {
-                    broker.run_data_plane_blocking();
-                }
-            }));
-
-            // give broker time to spin up
-            thread::sleep(Duration::from_millis(100));
-
-            Self {
-                _broker: broker,
-                _broker_threads: broker_threads,
-            }
-        }
-
-        fn connect_clients() -> (PubSub, PubSub) {
-            let mut publisher = PubSub::default();
-            let mut subscriber = PubSub::default();
-            
-            publisher.connect().expect("Publisher failed to connect");
-            subscriber.connect().expect("Subscriber failed to connect");
-
-            (publisher, subscriber)
-        }
-    }
 
     #[test]
     fn test_pubsub_and_subscriptions() {
-        let _ctx = TestContext::new();
-        let (mut publisher, mut subscriber) = TestContext::connect_clients();
+        let ctx = TestContext::new("/tmp/llmq-pubsub-and-subscriptions.sock");
+        let (mut publisher, mut subscriber) = ctx.connect_clients();
 
         // messages shouldn't be received when not subscribed
         publisher.enqueue_bytes("unsubscribed-topic", b"Should not receive this");
